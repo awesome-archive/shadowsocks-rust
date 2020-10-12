@@ -42,16 +42,15 @@
 //! These defined server will be used with a load balancing algorithm.
 
 use std::{
-    collections::HashSet,
-    convert::From,
+    convert::{From, Infallible},
     default::Default,
     error,
     fmt::{self, Debug, Display, Formatter},
     fs::OpenOptions,
-    io::Read,
+    io::{self, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     option::Option,
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
     string::ToString,
     time::Duration,
@@ -59,14 +58,22 @@ use std::{
 
 use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use json5;
-use log::{error, trace};
+use cfg_if::cfg_if;
+use log::error;
 use serde::{Deserialize, Serialize};
-use serde_urlencoded;
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
+#[cfg(feature = "trust-dns")]
 use trust_dns_resolver::config::{NameServerConfigGroup, ResolverConfig};
 use url::{self, Url};
 
-use crate::{crypto::cipher::CipherType, plugin::PluginConfig};
+use crate::{
+    acl::AccessControl,
+    context::Context,
+    crypto::cipher::CipherType,
+    plugin::PluginConfig,
+    relay::{dns_resolver::resolve_bind_addr, socks5::Address},
+};
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct SSConfig {
@@ -79,6 +86,10 @@ struct SSConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     local_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    manager_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manager_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     method: Option<String>,
@@ -87,21 +98,25 @@ struct SSConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     plugin_opts: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    plugin_args: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     udp_timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    udp_max_associations: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     servers: Option<Vec<SSServerExtConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    forbidden_ip: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     dns: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    remote_dns: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     no_delay: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nofile: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv6_first: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -115,9 +130,9 @@ struct SSServerExtConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     plugin_opts: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    timeout: Option<u64>,
+    plugin_args: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    udp_timeout: Option<u64>,
+    timeout: Option<u64>,
 }
 
 /// Server address
@@ -130,15 +145,6 @@ pub enum ServerAddr {
 }
 
 impl ServerAddr {
-    /// Get address for server listener
-    /// Panic if address is domain name
-    pub fn listen_addr(&self) -> &SocketAddr {
-        match *self {
-            ServerAddr::SocketAddr(ref s) => s,
-            _ => panic!("Cannot use domain name as server listen address"),
-        }
-    }
-
     /// Get string representation of domain
     pub fn host(&self) -> String {
         match *self {
@@ -152,6 +158,17 @@ impl ServerAddr {
         match *self {
             ServerAddr::SocketAddr(ref s) => s.port(),
             ServerAddr::DomainName(_, p) => p,
+        }
+    }
+
+    /// Convert for calling `bind()`
+    pub async fn bind_addr(&self, context: &Context) -> io::Result<SocketAddr> {
+        match resolve_bind_addr(context, self).await {
+            Ok(s) => Ok(s),
+            Err(err) => {
+                error!("Failed to resolve {} for bind(), error: {}", self, err);
+                Err(err)
+            }
         }
     }
 }
@@ -189,6 +206,54 @@ impl Display for ServerAddr {
     }
 }
 
+impl From<SocketAddr> for ServerAddr {
+    fn from(addr: SocketAddr) -> ServerAddr {
+        ServerAddr::SocketAddr(addr)
+    }
+}
+
+impl<I: Into<String>> From<(I, u16)> for ServerAddr {
+    fn from((dname, port): (I, u16)) -> ServerAddr {
+        ServerAddr::DomainName(dname.into(), port)
+    }
+}
+
+impl From<Address> for ServerAddr {
+    fn from(addr: Address) -> ServerAddr {
+        match addr {
+            Address::SocketAddress(sa) => ServerAddr::SocketAddr(sa),
+            Address::DomainNameAddress(dn, port) => ServerAddr::DomainName(dn, port),
+        }
+    }
+}
+
+impl From<&Address> for ServerAddr {
+    fn from(addr: &Address) -> ServerAddr {
+        match *addr {
+            Address::SocketAddress(sa) => ServerAddr::SocketAddr(sa),
+            Address::DomainNameAddress(ref dn, port) => ServerAddr::DomainName(dn.clone(), port),
+        }
+    }
+}
+
+impl From<ServerAddr> for Address {
+    fn from(addr: ServerAddr) -> Address {
+        match addr {
+            ServerAddr::SocketAddr(sa) => Address::SocketAddress(sa),
+            ServerAddr::DomainName(dn, port) => Address::DomainNameAddress(dn, port),
+        }
+    }
+}
+
+impl From<&ServerAddr> for Address {
+    fn from(addr: &ServerAddr) -> Address {
+        match *addr {
+            ServerAddr::SocketAddr(sa) => Address::SocketAddress(sa),
+            ServerAddr::DomainName(ref dn, port) => Address::DomainNameAddress(dn.clone(), port),
+        }
+    }
+}
+
 /// Configuration for a server
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -204,8 +269,6 @@ pub struct ServerConfig {
     enc_key: Bytes,
     /// Plugin config
     plugin: Option<PluginConfig>,
-    /// UDP timeout
-    udp_timeout: Option<Duration>,
     /// Plugin address
     plugin_addr: Option<ServerAddr>,
 }
@@ -220,7 +283,6 @@ impl ServerConfig {
         plugin: Option<PluginConfig>,
     ) -> ServerConfig {
         let enc_key = method.bytes_to_key(pwd.as_bytes());
-        trace!("Initialize config with pwd: {:?}, key: {:?}", pwd, enc_key);
         ServerConfig {
             addr,
             password: pwd,
@@ -228,7 +290,6 @@ impl ServerConfig {
             timeout,
             enc_key,
             plugin,
-            udp_timeout: None,
             plugin_addr: None,
         }
     }
@@ -265,6 +326,11 @@ impl ServerConfig {
         &self.enc_key[..]
     }
 
+    /// Clone encryption key
+    pub fn clone_key(&self) -> Bytes {
+        self.enc_key.clone()
+    }
+
     /// Get password
     pub fn password(&self) -> &str {
         &self.password[..]
@@ -285,19 +351,19 @@ impl ServerConfig {
         self.plugin.as_ref()
     }
 
-    /// Get UDP timeout
-    pub fn udp_timeout(&self) -> &Option<Duration> {
-        &self.udp_timeout
-    }
-
     /// Set plugin address
     pub fn set_plugin_addr(&mut self, a: ServerAddr) {
         self.plugin_addr = Some(a);
     }
 
     /// Get plugin address
-    pub fn plugin_addr(&self) -> &Option<ServerAddr> {
-        &self.plugin_addr
+    pub fn plugin_addr(&self) -> Option<&ServerAddr> {
+        self.plugin_addr.as_ref()
+    }
+
+    /// Get server's external address
+    pub fn external_addr(&self) -> &ServerAddr {
+        self.plugin_addr.as_ref().unwrap_or(&self.addr)
     }
 
     /// Get URL for QRCode
@@ -317,7 +383,7 @@ impl ServerConfig {
         let mut url = format!("ss://{}@{}", encoded_user_info, self.addr());
         if let Some(c) = self.plugin() {
             let mut plugin = c.plugin.clone();
-            if let Some(ref opt) = c.plugin_opt {
+            if let Some(ref opt) = c.plugin_opts {
                 plugin += ";";
                 plugin += opt;
             }
@@ -395,7 +461,8 @@ impl ServerConfig {
                     Some(p) => {
                         plugin = Some(PluginConfig {
                             plugin: p.to_owned(),
-                            plugin_opt: vsp.next().map(ToOwned::to_owned),
+                            plugin_opts: vsp.next().map(ToOwned::to_owned),
+                            plugin_args: Vec::new(), // SIP002 doesn't have arguments for plugins
                         })
                     }
                 }
@@ -413,6 +480,90 @@ impl FromStr for ServerConfig {
 
     fn from_str(s: &str) -> Result<ServerConfig, Self::Err> {
         ServerConfig::from_url(s)
+    }
+}
+
+/// Address for Manager server
+#[derive(Debug, Clone)]
+pub enum ManagerAddr {
+    /// IP address
+    SocketAddr(SocketAddr),
+    /// Domain name address
+    DomainName(String, u16),
+    /// Unix socket path
+    #[cfg(unix)]
+    UnixSocketAddr(PathBuf),
+}
+
+/// Error for parsing `ManagerAddr`
+#[derive(Debug)]
+pub struct ManagerAddrError;
+
+impl FromStr for ManagerAddr {
+    type Err = ManagerAddrError;
+
+    fn from_str(s: &str) -> Result<ManagerAddr, ManagerAddrError> {
+        match s.find(':') {
+            Some(pos) => {
+                // Contains a ':' in address, must be IP:Port or Domain:Port
+                match s.parse::<SocketAddr>() {
+                    Ok(saddr) => Ok(ManagerAddr::SocketAddr(saddr)),
+                    Err(..) => {
+                        // Splits into Domain and Port
+                        let (sdomain, sport) = s.split_at(pos);
+                        let (sdomain, sport) = (sdomain.trim(), sport[1..].trim());
+
+                        match sport.parse::<u16>() {
+                            Ok(port) => Ok(ManagerAddr::DomainName(sdomain.to_owned(), port)),
+                            Err(..) => Err(ManagerAddrError),
+                        }
+                    }
+                }
+            }
+            #[cfg(unix)]
+            None => {
+                // Must be a unix socket path
+                Ok(ManagerAddr::UnixSocketAddr(PathBuf::from(s)))
+            }
+            #[cfg(not(unix))]
+            None => Err(ManagerAddrError),
+        }
+    }
+}
+
+impl Display for ManagerAddr {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match *self {
+            ManagerAddr::SocketAddr(ref saddr) => fmt::Display::fmt(saddr, f),
+            ManagerAddr::DomainName(ref dname, port) => write!(f, "{}:{}", dname, port),
+            #[cfg(unix)]
+            ManagerAddr::UnixSocketAddr(ref path) => fmt::Display::fmt(&path.display(), f),
+        }
+    }
+}
+
+impl From<SocketAddr> for ManagerAddr {
+    fn from(addr: SocketAddr) -> ManagerAddr {
+        ManagerAddr::SocketAddr(addr)
+    }
+}
+
+impl<'a> From<(&'a str, u16)> for ManagerAddr {
+    fn from((dname, port): (&'a str, u16)) -> ManagerAddr {
+        ManagerAddr::DomainName(dname.to_owned(), port)
+    }
+}
+
+impl From<(String, u16)> for ManagerAddr {
+    fn from((dname, port): (String, u16)) -> ManagerAddr {
+        ManagerAddr::DomainName(dname, port)
+    }
+}
+
+#[cfg(unix)]
+impl From<PathBuf> for ManagerAddr {
+    fn from(p: PathBuf) -> ManagerAddr {
+        ManagerAddr::UnixSocketAddr(p)
     }
 }
 
@@ -449,21 +600,9 @@ impl fmt::Display for UrlParseError {
 }
 
 impl error::Error for UrlParseError {
-    fn description(&self) -> &str {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
-            UrlParseError::ParseError(ref err) => error::Error::description(err),
-            UrlParseError::InvalidScheme => "URL must have \"ss://\" scheme",
-            UrlParseError::InvalidUserInfo => "invalid user info",
-            UrlParseError::MissingHost => "missing host",
-            UrlParseError::InvalidAuthInfo => "invalid authentication info",
-            UrlParseError::InvalidServerAddr => "invalid server address",
-            UrlParseError::InvalidQueryString => "invalid query string",
-        }
-    }
-
-    fn cause(&self) -> Option<&error::Error> {
-        match *self {
-            UrlParseError::ParseError(ref err) => Some(err as &error::Error),
+            UrlParseError::ParseError(ref err) => Some(err as &dyn error::Error),
             UrlParseError::InvalidScheme => None,
             UrlParseError::InvalidUserInfo => None,
             UrlParseError::MissingHost => None,
@@ -475,17 +614,114 @@ impl error::Error for UrlParseError {
 }
 
 /// Listening address
-pub type ClientConfig = SocketAddr;
+pub type ClientConfig = ServerAddr;
 
 /// Server config type
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigType {
-    /// Config for local
+    /// Config for socks5 local
     ///
     /// Requires `local` configuration
-    Local,
+    Socks5Local,
+
+    /// Config for socks4 local
+    ///
+    /// Requires `local` configuration
+    #[cfg(feature = "local-socks4")]
+    Socks4Local,
+
+    /// Config for HTTP local
+    ///
+    /// Requires `local` configuration
+    #[cfg(feature = "local-http")]
+    HttpLocal,
+
+    /// Config for HTTPS local
+    ///
+    /// Requires `local` configuration
+    #[cfg(all(
+        feature = "local-http",
+        any(feature = "local-http-native-tls", feature = "local-http-rustls")
+    ))]
+    HttpsLocal,
+
+    /// Config for tunnel local
+    ///
+    /// Requires `local` and `forward` configuration
+    #[cfg(feature = "local-tunnel")]
+    TunnelLocal,
+
+    /// Config for redir local
+    ///
+    /// Requires `local` configuration
+    #[cfg(feature = "local-redir")]
+    RedirLocal,
+
+    /// Config for dns relay local
+    ///
+    /// Requires `local` configuration
+    #[cfg(feature = "local-dns-relay")]
+    DnsLocal,
+
     /// Config for server
     Server,
+
+    /// Config for Manager server
+    Manager,
+}
+
+impl ConfigType {
+    /// Check if it is local server type
+    pub fn is_local(self) -> bool {
+        match self {
+            ConfigType::Socks5Local => true,
+            #[cfg(feature = "local-socks4")]
+            ConfigType::Socks4Local => true,
+            #[cfg(feature = "local-dns-relay")]
+            ConfigType::DnsLocal => true,
+            #[cfg(feature = "local-tunnel")]
+            ConfigType::TunnelLocal => true,
+            #[cfg(feature = "local-http")]
+            ConfigType::HttpLocal => true,
+            #[cfg(all(
+                feature = "local-http",
+                any(feature = "local-http-native-tls", feature = "local-http-rustls")
+            ))]
+            ConfigType::HttpsLocal => true,
+            #[cfg(feature = "local-redir")]
+            ConfigType::RedirLocal => true,
+            ConfigType::Server | ConfigType::Manager => false,
+        }
+    }
+
+    /// Check if it is remote server type
+    pub fn is_server(self) -> bool {
+        match self {
+            ConfigType::Socks5Local => false,
+            #[cfg(feature = "local-socks4")]
+            ConfigType::Socks4Local => false,
+            #[cfg(feature = "local-dns-relay")]
+            ConfigType::DnsLocal => false,
+            #[cfg(feature = "local-tunnel")]
+            ConfigType::TunnelLocal => false,
+            #[cfg(feature = "local-http")]
+            ConfigType::HttpLocal => false,
+            #[cfg(all(
+                feature = "local-http",
+                any(feature = "local-http-native-tls", feature = "local-http-rustls")
+            ))]
+            ConfigType::HttpsLocal => false,
+            #[cfg(feature = "local-redir")]
+            ConfigType::RedirLocal => false,
+            ConfigType::Manager => false,
+            ConfigType::Server => true,
+        }
+    }
+
+    /// Check if it is manager server type
+    pub fn is_manager(self) -> bool {
+        matches!(self, ConfigType::Manager)
+    }
 }
 
 /// Server mode
@@ -498,17 +734,11 @@ pub enum Mode {
 
 impl Mode {
     pub fn enable_udp(self) -> bool {
-        match self {
-            Mode::UdpOnly | Mode::TcpAndUdp => true,
-            _ => false,
-        }
+        matches!(self, Mode::UdpOnly | Mode::TcpAndUdp)
     }
 
     pub fn enable_tcp(self) -> bool {
-        match self {
-            Mode::TcpOnly | Mode::TcpAndUdp => true,
-            _ => false,
-        }
+        matches!(self, Mode::TcpOnly | Mode::TcpAndUdp)
     }
 }
 
@@ -535,27 +765,349 @@ impl FromStr for Mode {
     }
 }
 
+/// Transparent Proxy type
+#[derive(Clone, Copy, Debug, Eq, PartialEq, EnumIter)]
+pub enum RedirType {
+    /// For not supported platforms
+    NotSupported,
+
+    /// For Linux-like systems' Netfilter `REDIRECT`. Only for TCP connections.
+    ///
+    /// This is supported from Linux 2.4 Kernel. Document: https://www.netfilter.org/documentation/index.html#documentation-howto
+    ///
+    /// NOTE: Filter rule `REDIRECT` can only be applied to TCP connections.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Redirect,
+
+    /// For Linux-like systems' Netfilter TPROXY rule.
+    ///
+    /// NOTE: Filter rule `TPROXY` can be applied to TCP and UDP connections.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    TProxy,
+
+    /// Packet Filter (pf)
+    ///
+    /// Supported by OpenBSD 3.0+, FreeBSD 5.3+, NetBSD 3.0+, Solaris 11.3+, macOS 10.7+, iOS, QNX
+    ///
+    /// Document: https://www.freebsd.org/doc/handbook/firewalls-pf.html
+    #[cfg(any(
+        target_os = "openbsd",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    PacketFilter,
+
+    /// IPFW
+    ///
+    /// Supported by FreeBSD, macOS 10.6- (Have been removed completely on macOS 10.10)
+    ///
+    /// Document: https://www.freebsd.org/doc/handbook/firewalls-ipfw.html
+    #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "ios"))]
+    IpFirewall,
+}
+
+impl RedirType {
+    cfg_if! {
+        if #[cfg(any(target_os = "linux", target_os = "android"))] {
+            /// Default TCP transparent proxy solution on this platform
+            pub fn tcp_default() -> RedirType {
+                RedirType::Redirect
+            }
+
+            /// Default UDP transparent proxy solution on this platform
+            pub fn udp_default() -> RedirType {
+                RedirType::TProxy
+            }
+        } else if #[cfg(any(target_os = "openbsd", target_os = "freebsd"))] {
+            /// Default TCP transparent proxy solution on this platform
+            pub fn tcp_default() -> RedirType {
+                RedirType::PacketFilter
+            }
+
+            /// Default UDP transparent proxy solution on this platform
+            pub fn udp_default() -> RedirType {
+                RedirType::PacketFilter
+            }
+        } else if #[cfg(any(target_os = "netbsd", target_os = "solaris", target_os = "macos", target_os = "ios"))] {
+            /// Default TCP transparent proxy solution on this platform
+            pub fn tcp_default() -> RedirType {
+                RedirType::PacketFilter
+            }
+
+            /// Default UDP transparent proxy solution on this platform
+            pub fn udp_default() -> RedirType {
+                RedirType::NotSupported
+            }
+        } else {
+            /// Default TCP transparent proxy solution on this platform
+            pub fn tcp_default() -> RedirType {
+                RedirType::NotSupported
+            }
+
+            /// Default UDP transparent proxy solution on this platform
+            pub fn udp_default() -> RedirType {
+                RedirType::NotSupported
+            }
+        }
+    }
+
+    /// Check if transparent proxy is supported on this platform
+    pub fn is_supported(self) -> bool {
+        self != RedirType::NotSupported
+    }
+
+    /// Name of redirect type (transparent proxy type)
+    pub fn name(self) -> &'static str {
+        match self {
+            // Dummy, shouldn't be used in any useful situations
+            RedirType::NotSupported => "not_supported",
+
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            RedirType::Redirect => "redirect",
+
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            RedirType::TProxy => "tproxy",
+
+            #[cfg(any(
+                target_os = "openbsd",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "solaris",
+                target_os = "macos",
+                target_os = "ios"
+            ))]
+            RedirType::PacketFilter => "pf",
+
+            #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "ios"))]
+            RedirType::IpFirewall => "ipfw",
+        }
+    }
+
+    /// Get all available types
+    pub fn available_types() -> Vec<&'static str> {
+        let mut v = Vec::new();
+        for e in Self::iter() {
+            match e {
+                RedirType::NotSupported => continue,
+                #[allow(unreachable_patterns)]
+                _ => v.push(e.name()),
+            }
+        }
+        v
+    }
+}
+
+impl Display for RedirType {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+#[derive(Debug)]
+pub struct InvalidRedirType;
+
+impl FromStr for RedirType {
+    type Err = InvalidRedirType;
+
+    fn from_str(s: &str) -> Result<RedirType, InvalidRedirType> {
+        match s {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            "redirect" => Ok(RedirType::Redirect),
+
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            "tproxy" => Ok(RedirType::TProxy),
+
+            #[cfg(any(
+                target_os = "openbsd",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "solaris",
+                target_os = "macos",
+                target_os = "ios",
+            ))]
+            "pf" => Ok(RedirType::PacketFilter),
+
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "dragonfly"
+            ))]
+            "ipfw" => Ok(RedirType::IpFirewall),
+
+            _ => Err(InvalidRedirType),
+        }
+    }
+}
+
+/// Host for servers to bind
+///
+/// Servers will bind to a port of this host
+#[derive(Clone, Debug)]
+pub enum ManagerServerHost {
+    /// Domain name
+    Domain(String),
+    /// IP address
+    Ip(IpAddr),
+}
+
+impl Default for ManagerServerHost {
+    fn default() -> ManagerServerHost {
+        ManagerServerHost::Ip(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)))
+    }
+}
+
+impl FromStr for ManagerServerHost {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse::<IpAddr>() {
+            Ok(s) => Ok(ManagerServerHost::Ip(s)),
+            Err(..) => Ok(ManagerServerHost::Domain(s.to_owned())),
+        }
+    }
+}
+
+impl ManagerServerHost {
+    /// Get resolved socket address for servers to bind
+    pub async fn bind_addr(&self, ctx: &Context, port: u16) -> io::Result<SocketAddr> {
+        match *self {
+            ManagerServerHost::Domain(ref domain) => {
+                let vaddrs = ctx.dns_resolve(domain, port).await?;
+                Ok(vaddrs[0])
+            }
+            ManagerServerHost::Ip(ip) => Ok(SocketAddr::new(ip, port)),
+        }
+    }
+}
+
+/// Configuration for Manager
+#[derive(Clone, Debug)]
+pub struct ManagerConfig {
+    /// Address of `ss-manager`. Send servers' statistic data to the manager server
+    pub addr: ManagerAddr,
+    /// Manager's default method
+    pub method: Option<CipherType>,
+    /// Timeout for TCP connections, setting to manager's created servers
+    pub timeout: Option<Duration>,
+    /// IP/Host for servers to bind (inbound)
+    ///
+    /// Note: Outbound address is defined in Config.local_addr
+    pub server_host: ManagerServerHost,
+}
+
+impl ManagerConfig {
+    /// Create a ManagerConfig with default options
+    pub fn new(addr: ManagerAddr) -> ManagerConfig {
+        ManagerConfig {
+            addr,
+            method: None,
+            timeout: None,
+            server_host: ManagerServerHost::default(),
+        }
+    }
+
+    /// Get resolved socket address for servers to bind
+    pub async fn bind_addr(&self, ctx: &Context, port: u16) -> io::Result<SocketAddr> {
+        self.server_host.bind_addr(ctx, port).await
+    }
+}
+
 /// Configuration
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Remote ShadowSocks server configurations
     pub server: Vec<ServerConfig>,
-    pub local: Option<ClientConfig>,
-    pub forbidden_ip: HashSet<IpAddr>,
+    /// Local server's bind address, or ShadowSocks server's outbound address
+    pub local_addr: Option<ClientConfig>,
+    /// Destination address for tunnel
+    pub forward: Option<Address>,
+    /// DNS configuration, uses system-wide DNS configuration by default
+    ///
+    /// Value could be a `IpAddr`, uses UDP DNS protocol with port `53`. For example: `8.8.8.8`
+    ///
+    /// Also Value could be some pre-defined DNS server names:
+    ///
+    /// - `google`
+    /// - `cloudflare`, `cloudflare_tls`, `cloudflare_https`
+    /// - `quad9`, `quad9_tls`
     pub dns: Option<String>,
-    pub remote_dns: Option<SocketAddr>,
+    /// Server mode, `tcp_only`, `tcp_and_udp`, and `udp_only`
     pub mode: Mode,
+    /// Set `TCP_NODELAY` socket option
     pub no_delay: bool,
-    pub manager_address: Option<ServerAddr>,
+    /// Manager's configuration
+    pub manager: Option<ManagerConfig>,
+    /// Config is for Client or Server
     pub config_type: ConfigType,
+    /// Timeout for UDP Associations, default is 5 minutes
+    pub udp_timeout: Option<Duration>,
+    /// Maximum number of UDP Associations, default is unconfigured
+    pub udp_max_associations: Option<usize>,
+    /// UDP relay's bind address, it uses `local_addr` by default
+    ///
+    /// Resolving Android's issue: https://github.com/shadowsocks/shadowsocks-android/issues/2571
+    pub udp_bind_addr: Option<ClientConfig>,
+    /// `RLIMIT_NOFILE` option for *nix systems
+    pub nofile: Option<u64>,
+    /// ACL configuration
+    pub acl: Option<AccessControl>,
+    /// Path to stat callback unix address, only for Android
+    /// TCP Transparent Proxy type
+    pub tcp_redir: RedirType,
+    /// UDP Transparent Proxy type
+    pub udp_redir: RedirType,
+    /// Android flow statistic report Unix socket path
+    #[cfg(feature = "local-flow-stat")]
+    pub stat_path: Option<PathBuf>,
+    /// Path to protect callback unix address, only for Android
+    pub protect_path: Option<PathBuf>,
+    /// Path for local DNS resolver, only for Android
+    pub local_dns_path: Option<PathBuf>,
+    /// Internal DNS's bind address
+    #[cfg(feature = "local-dns-relay")]
+    pub dns_local_addr: Option<ClientConfig>,
+    /// Local DNS's address
+    ///
+    /// Sending DNS query directly to this address
+    pub local_dns_addr: Option<SocketAddr>,
+    /// Remote DNS's address
+    ///
+    /// Sending DNS query through proxy to this address
+    pub remote_dns_addr: Option<Address>,
+    /// Uses IPv6 addresses first
+    ///
+    /// Set to `true` if you want to query IPv6 addresses before IPv4
+    pub ipv6_first: bool,
+    /// TLS cryptographic identity (X509), PKCS #12 format
+    #[cfg(feature = "local-http-native-tls")]
+    pub tls_identity_path: Option<PathBuf>,
+    /// TLS cryptographic identity's password
+    #[cfg(feature = "local-http-native-tls")]
+    pub tls_identity_password: Option<String>,
+    /// TLS cryptographic identity, certificate file path (PEM)
+    #[cfg(feature = "local-http-rustls")]
+    pub tls_identity_certificate_path: Option<PathBuf>,
+    /// TLS cryptographic identity, private keys (PEM), RSA or PKCS #8
+    #[cfg(feature = "local-http-rustls")]
+    pub tls_identity_private_key_path: Option<PathBuf>,
 }
 
 /// Configuration parsing error kind
 #[derive(Copy, Clone, Debug)]
 pub enum ErrorKind {
+    /// Missing required fields in JSON configuration
     MissingField,
+    /// Missing some keys that must be provided together
     Malformed,
+    /// Invalid value of some configuration keys
     Invalid,
+    /// Invalid JSON
     JsonParsingError,
+    /// `std::io::Error`
     IoError,
 }
 
@@ -594,60 +1146,85 @@ impl Debug for Error {
     }
 }
 
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self.detail {
+            None => f.write_str(self.desc),
+            Some(ref d) => write!(f, "{}, {}", self.desc, d),
+        }
+    }
+}
+
 impl Config {
     /// Creates an empty configuration
     pub fn new(config_type: ConfigType) -> Config {
         Config {
             server: Vec::new(),
-            local: None,
-            forbidden_ip: HashSet::new(),
+            local_addr: None,
+            forward: None,
             dns: None,
-            remote_dns: None,
             mode: Mode::TcpOnly,
             no_delay: false,
-            manager_address: None,
+            manager: None,
             config_type,
+            udp_timeout: None,
+            udp_max_associations: None,
+            udp_bind_addr: None,
+            nofile: None,
+            acl: None,
+            tcp_redir: RedirType::tcp_default(),
+            udp_redir: RedirType::udp_default(),
+            #[cfg(feature = "local-flow-stat")]
+            stat_path: None,
+            protect_path: None,
+            local_dns_path: None,
+            #[cfg(feature = "local-dns-relay")]
+            dns_local_addr: None,
+            local_dns_addr: None,
+            remote_dns_addr: None,
+            ipv6_first: false,
+            #[cfg(feature = "local-http-native-tls")]
+            tls_identity_path: None,
+            #[cfg(feature = "local-http-native-tls")]
+            tls_identity_password: None,
+            #[cfg(feature = "local-http-rustls")]
+            tls_identity_certificate_path: None,
+            #[cfg(feature = "local-http-rustls")]
+            tls_identity_private_key_path: None,
         }
     }
 
     fn load_from_ssconfig(config: SSConfig, config_type: ConfigType) -> Result<Config, Error> {
-        let check_local = match config_type {
-            ConfigType::Local => true,
-            ConfigType::Server => false,
-        };
-
-        if check_local && (config.local_address.is_none() || config.local_port.is_none()) {
-            let err = Error::new(
-                ErrorKind::Malformed,
-                "`local_address` and `local_port` are required in client",
-                None,
-            );
-            return Err(err);
-        }
-
         let mut nconfig = Config::new(config_type);
 
         // Standard config
         // Client
         if let Some(la) = config.local_address {
-            let port = config.local_port.unwrap();
-
-            let local = match la.parse::<Ipv4Addr>() {
-                Ok(v4) => SocketAddr::V4(SocketAddrV4::new(v4, port)),
-                Err(..) => match la.parse::<Ipv6Addr>() {
-                    Ok(v6) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, 0)),
-                    Err(..) => {
-                        let err = Error::new(
-                            ErrorKind::Malformed,
-                            "`local_address` must be an ipv4 or ipv6 address",
-                            None,
-                        );
-                        return Err(err);
+            let port = match config.local_port {
+                // Let system allocate port by default
+                None => {
+                    let err = Error::new(ErrorKind::MissingField, "missing `local_port`", None);
+                    return Err(err);
+                }
+                Some(p) => {
+                    if config_type.is_server() {
+                        // Server can only bind to address, port should always be 0
+                        0
+                    } else {
+                        p
                     }
-                },
+                }
             };
 
-            nconfig.local = Some(local);
+            let local = match la.parse::<IpAddr>() {
+                Ok(ip) => ServerAddr::from(SocketAddr::new(ip, port)),
+                Err(..) => {
+                    // treated as domain
+                    ServerAddr::from((la, port))
+                }
+            };
+
+            nconfig.local_addr = Some(local);
         }
 
         // Standard config
@@ -678,16 +1255,13 @@ impl Config {
                     None => None,
                     Some(plugin) => Some(PluginConfig {
                         plugin,
-                        plugin_opt: config.plugin_opts,
+                        plugin_opts: config.plugin_opts,
+                        plugin_args: config.plugin_args.unwrap_or_default(),
                     }),
                 };
 
                 let timeout = config.timeout.map(Duration::from_secs);
-                let udp_timeout = config.udp_timeout.map(Duration::from_secs);
-
-                let mut nsvr = ServerConfig::new(addr, pwd, method, timeout, plugin);
-
-                nsvr.udp_timeout = udp_timeout;
+                let nsvr = ServerConfig::new(addr, pwd, method, timeout, plugin);
 
                 nconfig.server.push(nsvr);
             }
@@ -729,51 +1303,56 @@ impl Config {
                     None => None,
                     Some(p) => Some(PluginConfig {
                         plugin: p,
-                        plugin_opt: svr.plugin_opts,
+                        plugin_opts: svr.plugin_opts,
+                        plugin_args: svr.plugin_args.unwrap_or_default(),
                     }),
                 };
 
-                let timeout = svr.timeout.map(Duration::from_secs);
-                let udp_timeout = config.udp_timeout.map(Duration::from_secs);
-
-                let mut nsvr = ServerConfig::new(addr, svr.password, method, timeout, plugin);
-
-                nsvr.udp_timeout = udp_timeout;
+                let timeout = svr.timeout.or(config.timeout).map(Duration::from_secs);
+                let nsvr = ServerConfig::new(addr, svr.password, method, timeout, plugin);
 
                 nconfig.server.push(nsvr);
             }
         }
 
-        // Forbidden IPs
-        if let Some(forbidden_ip) = config.forbidden_ip {
-            for fi in forbidden_ip {
-                match fi.parse::<IpAddr>() {
-                    Ok(i) => {
-                        nconfig.forbidden_ip.insert(i);
-                    }
-                    Err(err) => {
-                        error!("Invalid forbidden_ip \"{}\", err: {}", fi, err);
-                    }
+        // Set timeout globally
+        if let Some(timeout) = config.timeout {
+            let timeout = Duration::from_secs(timeout);
+            // Set as a default timeout
+            for svr in &mut nconfig.server {
+                if svr.timeout.is_none() {
+                    svr.timeout = Some(timeout);
                 }
             }
+        }
+
+        // Manager Address
+        if let Some(ma) = config.manager_address {
+            let manager = match config.manager_port {
+                Some(port) => {
+                    match ma.parse::<IpAddr>() {
+                        Ok(ip) => ManagerAddr::from(SocketAddr::new(ip, port)),
+                        Err(..) => {
+                            // treated as domain
+                            ManagerAddr::from((ma, port))
+                        }
+                    }
+                }
+                #[cfg(unix)]
+                None => ManagerAddr::from(PathBuf::from(ma)),
+                #[cfg(not(unix))]
+                None => {
+                    let e = Error::new(ErrorKind::MissingField, "missing `manager_port`", None);
+                    return Err(e);
+                }
+            };
+
+            let manager_config = ManagerConfig::new(manager);
+            nconfig.manager = Some(manager_config);
         }
 
         // DNS
         nconfig.dns = config.dns;
-
-        if let Some(rdns) = config.remote_dns {
-            match rdns.parse::<SocketAddr>() {
-                Ok(r) => nconfig.remote_dns = Some(r),
-                Err(..) => {
-                    let e = Error::new(
-                        ErrorKind::Malformed,
-                        "malformed `remote_dns`, which must be a valid SocketAddr",
-                        None,
-                    );
-                    return Err(e);
-                }
-            }
-        }
 
         // Mode
         if let Some(m) = config.mode {
@@ -795,14 +1374,30 @@ impl Config {
             nconfig.no_delay = b;
         }
 
+        // UDP
+        nconfig.udp_timeout = config.udp_timeout.map(Duration::from_secs);
+
+        // Maximum associations to be kept simultaneously
+        nconfig.udp_max_associations = config.udp_max_associations;
+
+        // RLIMIT_NOFILE
+        nconfig.nofile = config.nofile;
+
+        // Uses IPv6 first
+        if let Some(f) = config.ipv6_first {
+            nconfig.ipv6_first = f;
+        }
+
         Ok(nconfig)
     }
 
+    /// Load Config from a `str`
     pub fn load_from_str(s: &str, config_type: ConfigType) -> Result<Config, Error> {
         let c = json5::from_str::<SSConfig>(s)?;
         Config::load_from_ssconfig(c, config_type)
     }
 
+    /// Load Config from a File
     pub fn load_from_file(filename: &str, config_type: ConfigType) -> Result<Config, Error> {
         let mut reader = OpenOptions::new().read(true).open(&Path::new(filename))?;
         let mut content = String::new();
@@ -810,20 +1405,28 @@ impl Config {
         Config::load_from_str(&content[..], config_type)
     }
 
+    #[doc(hidden)]
+    #[cfg(feature = "trust-dns")]
+    /// Get `trust-dns`'s `ResolverConfig` by DNS configuration string
     pub fn get_dns_config(&self) -> Option<ResolverConfig> {
         self.dns.as_ref().and_then(|ds| {
             match &ds[..] {
                 "google" => Some(ResolverConfig::google()),
 
                 "cloudflare" => Some(ResolverConfig::cloudflare()),
+                #[cfg(feature = "dns-over-tls")]
                 "cloudflare_tls" => Some(ResolverConfig::cloudflare_tls()),
+                #[cfg(feature = "dns-over-https")]
                 "cloudflare_https" => Some(ResolverConfig::cloudflare_https()),
 
                 "quad9" => Some(ResolverConfig::quad9()),
+                #[cfg(feature = "dns-over-tls")]
                 "quad9_tls" => Some(ResolverConfig::quad9_tls()),
 
                 _ => {
                     // Set ips directly
+                    //
+                    // TODO: Support customizable DNS over TLS or HTTPS
                     match ds.parse::<IpAddr>() {
                         Ok(ip) => Some(ResolverConfig::from_parts(
                             None,
@@ -843,11 +1446,58 @@ impl Config {
         })
     }
 
-    pub fn get_remote_dns(&self) -> SocketAddr {
-        match self.remote_dns {
-            None => SocketAddr::from(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53)),
-            Some(ip) => ip,
+    /// Check if there are any plugin are enabled with servers
+    pub fn has_server_plugins(&self) -> bool {
+        for server in &self.server {
+            if server.plugin().is_some() {
+                return true;
+            }
         }
+        false
+    }
+
+    /// Check if all required fields are already set
+    pub fn check_integrity(&self) -> Result<(), Error> {
+        if self.config_type.is_local() {
+            if self.local_addr.is_some() {
+                return Ok(());
+            }
+
+            let err = Error::new(
+                ErrorKind::MissingField,
+                "missing `local_address` and `local_port` for client configuration",
+                None,
+            );
+            return Err(err);
+        }
+
+        if self.config_type.is_server() {
+            if !self.server.is_empty() {
+                return Ok(());
+            }
+
+            let err = Error::new(
+                ErrorKind::MissingField,
+                "missing any valid servers in configuration",
+                None,
+            );
+            return Err(err);
+        }
+
+        if self.config_type.is_manager() {
+            if self.manager.is_some() {
+                return Ok(());
+            }
+
+            let err = Error::new(
+                ErrorKind::MissingField,
+                "missing `manager_addr` and `manager_port` in configuration",
+                None,
+            );
+            return Err(err);
+        }
+
+        Ok(())
     }
 }
 
@@ -857,51 +1507,93 @@ impl fmt::Display for Config {
 
         let mut jconf = SSConfig::default();
 
-        if let Some(ref client) = self.local {
-            jconf.local_address = Some(client.ip().to_string());
-            jconf.local_port = Some(client.port());
+        if let Some(ref client) = self.local_addr {
+            match *client {
+                ServerAddr::SocketAddr(ref sa) => {
+                    jconf.local_address = Some(sa.ip().to_string());
+                    jconf.local_port = Some(sa.port());
+                }
+                ServerAddr::DomainName(ref dname, port) => {
+                    jconf.local_address = Some(dname.to_owned());
+                    jconf.local_port = Some(port);
+                }
+            }
         }
 
         // Servers
         // For 1 servers, uses standard configure format
-        if self.server.len() == 1 {
-            let svr = &self.server[0];
+        match self.server.len() {
+            0 => {}
+            1 => {
+                let svr = &self.server[0];
 
-            jconf.server = Some(match *svr.addr() {
-                ServerAddr::SocketAddr(ref sa) => sa.ip().to_string(),
-                ServerAddr::DomainName(ref dm, ..) => dm.to_string(),
-            });
-            jconf.server_port = Some(match *svr.addr() {
-                ServerAddr::SocketAddr(ref sa) => sa.port(),
-                ServerAddr::DomainName(.., port) => port,
-            });
-            jconf.method = Some(svr.method().to_string());
-            jconf.password = Some(svr.password().to_string());
-            jconf.plugin = svr.plugin().map(|p| p.plugin.to_string());
-            jconf.plugin_opts = svr.plugin().and_then(|p| p.plugin_opt.clone());
-            jconf.timeout = svr.timeout().map(|t| t.as_secs());
-            jconf.udp_timeout = svr.udp_timeout().map(|t| t.as_secs());
-        } else if self.server.len() > 1 {
-            let mut vsvr = Vec::new();
-
-            for svr in &self.server {
-                vsvr.push(SSServerExtConfig {
-                    address: match *svr.addr() {
-                        ServerAddr::SocketAddr(ref sa) => sa.ip().to_string(),
-                        ServerAddr::DomainName(ref dm, ..) => dm.to_string(),
-                    },
-                    port: match *svr.addr() {
-                        ServerAddr::SocketAddr(ref sa) => sa.port(),
-                        ServerAddr::DomainName(.., port) => port,
-                    },
-                    password: svr.password().to_string(),
-                    method: svr.method().to_string(),
-                    plugin: svr.plugin().map(|p| p.plugin.to_string()),
-                    plugin_opts: svr.plugin().and_then(|p| p.plugin_opt.clone()),
-                    timeout: svr.timeout().map(|t| t.as_secs()),
-                    udp_timeout: svr.udp_timeout().map(|t| t.as_secs()),
+                jconf.server = Some(match *svr.addr() {
+                    ServerAddr::SocketAddr(ref sa) => sa.ip().to_string(),
+                    ServerAddr::DomainName(ref dm, ..) => dm.to_string(),
                 });
+                jconf.server_port = Some(match *svr.addr() {
+                    ServerAddr::SocketAddr(ref sa) => sa.port(),
+                    ServerAddr::DomainName(.., port) => port,
+                });
+                jconf.method = Some(svr.method().to_string());
+                jconf.password = Some(svr.password().to_string());
+                jconf.plugin = svr.plugin().map(|p| p.plugin.to_string());
+                jconf.plugin_opts = svr.plugin().and_then(|p| p.plugin_opts.clone());
+                jconf.plugin_args = svr.plugin().and_then(|p| {
+                    if p.plugin_args.is_empty() {
+                        None
+                    } else {
+                        Some(p.plugin_args.clone())
+                    }
+                });
+                jconf.timeout = svr.timeout().map(|t| t.as_secs());
             }
+            _ => {
+                let mut vsvr = Vec::new();
+
+                for svr in &self.server {
+                    vsvr.push(SSServerExtConfig {
+                        address: match *svr.addr() {
+                            ServerAddr::SocketAddr(ref sa) => sa.ip().to_string(),
+                            ServerAddr::DomainName(ref dm, ..) => dm.to_string(),
+                        },
+                        port: match *svr.addr() {
+                            ServerAddr::SocketAddr(ref sa) => sa.port(),
+                            ServerAddr::DomainName(.., port) => port,
+                        },
+                        password: svr.password().to_string(),
+                        method: svr.method().to_string(),
+                        plugin: svr.plugin().map(|p| p.plugin.to_string()),
+                        plugin_opts: svr.plugin().and_then(|p| p.plugin_opts.clone()),
+                        plugin_args: svr.plugin().and_then(|p| {
+                            if p.plugin_args.is_empty() {
+                                None
+                            } else {
+                                Some(p.plugin_args.clone())
+                            }
+                        }),
+                        timeout: svr.timeout().map(|t| t.as_secs()),
+                    });
+                }
+
+                jconf.servers = Some(vsvr);
+            }
+        }
+
+        if let Some(ref m) = self.manager {
+            jconf.manager_address = Some(match m.addr {
+                ManagerAddr::SocketAddr(ref saddr) => saddr.ip().to_string(),
+                ManagerAddr::DomainName(ref dname, ..) => dname.clone(),
+                #[cfg(unix)]
+                ManagerAddr::UnixSocketAddr(ref path) => path.display().to_string(),
+            });
+
+            jconf.manager_port = match m.addr {
+                ManagerAddr::SocketAddr(ref saddr) => Some(saddr.port()),
+                ManagerAddr::DomainName(.., port) => Some(port),
+                #[cfg(unix)]
+                ManagerAddr::UnixSocketAddr(..) => None,
+            };
         }
 
         jconf.mode = Some(self.mode.to_string());
@@ -910,20 +1602,18 @@ impl fmt::Display for Config {
             jconf.no_delay = Some(self.no_delay);
         }
 
-        if !self.forbidden_ip.is_empty() {
-            let mut vfi = Vec::new();
-            for fi in &self.forbidden_ip {
-                vfi.push(fi.to_string());
-            }
-            jconf.forbidden_ip = Some(vfi);
-        }
-
         if let Some(ref dns) = self.dns {
             jconf.dns = Some(dns.to_string());
         }
 
-        if let Some(ref remote_dns) = self.remote_dns {
-            jconf.remote_dns = Some(remote_dns.to_string());
+        jconf.udp_timeout = self.udp_timeout.map(|t| t.as_secs());
+
+        jconf.udp_max_associations = self.udp_max_associations;
+
+        jconf.nofile = self.nofile;
+
+        if self.ipv6_first {
+            jconf.ipv6_first = Some(self.ipv6_first);
         }
 
         write!(f, "{}", json5::to_string(&jconf).unwrap())

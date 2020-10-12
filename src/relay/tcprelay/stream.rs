@@ -2,198 +2,150 @@
 
 use std::{
     cmp,
-    io::{self, BufRead, Read},
+    io,
+    marker::Unpin,
+    pin::Pin,
+    task::{Context, Poll},
 };
 
 use crate::crypto::{new_stream, BoxStreamCipher, CipherType, CryptoMode};
-use bytes::{BufMut, BytesMut};
-use tokio_io::{AsyncRead, AsyncWrite};
+use bytes::{Buf, BufMut, BytesMut};
+use futures::ready;
+use tokio::prelude::*;
 
-use super::{DecryptedRead, EncryptedWrite, BUFFER_SIZE};
+use super::BUFFER_SIZE;
 
 const DUMMY_BUFFER: [u8; BUFFER_SIZE] = [0u8; BUFFER_SIZE];
 
 /// Reader wrapper that will decrypt data automatically
-pub struct DecryptedReader<R>
-where
-    R: AsyncRead,
-{
-    reader: R,
+pub struct DecryptedReader {
     buffer: BytesMut,
     cipher: BoxStreamCipher,
     pos: usize,
-    sent_final: bool,
+    got_final: bool,
+    incoming_buffer: Vec<u8>,
 }
 
-impl<R> DecryptedReader<R>
-where
-    R: AsyncRead,
-{
-    pub fn new(r: R, t: CipherType, key: &[u8], iv: &[u8]) -> DecryptedReader<R> {
+impl DecryptedReader {
+    pub fn new(t: CipherType, key: &[u8], iv: &[u8]) -> DecryptedReader {
         let cipher = new_stream(t, key, iv, CryptoMode::Decrypt);
         let buffer_size = cipher.buffer_size(&DUMMY_BUFFER);
         DecryptedReader {
-            reader: r,
             buffer: BytesMut::with_capacity(buffer_size),
             cipher,
             pos: 0,
-            sent_final: false,
+            got_final: false,
+            incoming_buffer: vec![0u8; BUFFER_SIZE],
         }
     }
 
-    pub fn get_ref(&self) -> &R {
-        &self.reader
-    }
-
-    /// Gets a mutable reference to the underlying reader.
-    ///
-    /// # Warning
-    ///
-    /// It is inadvisable to read directly from or write directly to the
-    /// underlying reader.
-    pub fn get_mut(&mut self) -> &mut R {
-        &mut self.reader
-    }
-
-    /// Unwraps this `DecryptedReader`, returning the underlying reader.
-    ///
-    /// The internal buffer is flushed before returning the reader. Any leftover
-    /// data in the read buffer is lost.
-    pub fn into_inner(self) -> R {
-        self.reader
-    }
-}
-
-impl<R> BufRead for DecryptedReader<R>
-where
-    R: AsyncRead,
-{
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+    pub fn poll_read_decrypted<R>(
+        &mut self,
+        ctx: &mut Context<'_>,
+        r: &mut R,
+        dst: &mut [u8],
+    ) -> Poll<io::Result<usize>>
+    where
+        R: AsyncRead + Unpin,
+    {
         while self.pos >= self.buffer.len() {
-            if self.sent_final {
-                return Ok(&[]);
+            if self.got_final {
+                return Poll::Ready(Ok(0));
             }
 
-            let mut incoming = [0u8; BUFFER_SIZE];
+            let n = ready!(Pin::new(&mut *r).poll_read(ctx, &mut self.incoming_buffer))?;
+
+            // Reset pointers
             self.buffer.clear();
-            match self.reader.read(&mut incoming) {
-                Ok(0) => {
-                    // Ensure we have enough space
-                    let buffer_len = self.buffer_size(&[]);
-                    self.buffer.reserve(buffer_len);
-
-                    // EOF
-                    self.cipher.finalize(&mut self.buffer)?;
-                    self.sent_final = true;
-                }
-                Ok(l) => {
-                    let data = &incoming[..l];
-
-                    // Ensure we have enough space
-                    let buffer_len = self.buffer_size(data);
-                    self.buffer.reserve(buffer_len);
-
-                    self.cipher.update(data, &mut self.buffer)?;
-                }
-                Err(err) => {
-                    return Err(err);
-                }
-            }
-
             self.pos = 0;
+
+            if n == 0 {
+                // Finialize block
+                self.buffer.reserve(self.buffer_size(&[]));
+                self.cipher.finalize(&mut self.buffer)?;
+                self.got_final = true;
+            } else {
+                let data = &self.incoming_buffer[..n];
+                // Ensure we have enough space
+                let buffer_len = self.buffer_size(data);
+                self.buffer.reserve(buffer_len);
+                self.cipher.update(data, &mut self.buffer)?;
+            }
         }
 
-        Ok(&self.buffer[self.pos..])
+        let remaining_len = self.buffer.len() - self.pos;
+        let n = cmp::min(dst.len(), remaining_len);
+        (&mut dst[..n]).copy_from_slice(&self.buffer[self.pos..self.pos + n]);
+        self.pos += n;
+        Poll::Ready(Ok(n))
     }
 
-    fn consume(&mut self, amt: usize) {
-        self.pos = cmp::min(self.pos + amt, self.buffer.len());
-    }
-}
-
-impl<R> Read for DecryptedReader<R>
-where
-    R: AsyncRead,
-{
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let nread = {
-            let mut available = self.fill_buf()?;
-            available.read(buf)?
-        };
-        self.consume(nread);
-        Ok(nread)
-    }
-}
-
-impl<R> DecryptedRead for DecryptedReader<R>
-where
-    R: AsyncRead,
-{
     fn buffer_size(&self, data: &[u8]) -> usize {
         self.cipher.buffer_size(data)
     }
 }
 
-impl<R> AsyncRead for DecryptedReader<R> where R: AsyncRead {}
+enum EncryptWriteStep {
+    Nothing,
+    Writing,
+}
 
 /// Writer wrapper that will encrypt data automatically
-pub struct EncryptedWriter<W>
-where
-    W: AsyncWrite,
-{
-    writer: W,
+pub struct EncryptedWriter {
     cipher: BoxStreamCipher,
+    steps: EncryptWriteStep,
+    buf: BytesMut,
 }
 
-impl<W> EncryptedWriter<W>
-where
-    W: AsyncWrite,
-{
+impl EncryptedWriter {
     /// Creates a new EncryptedWriter
-    pub fn new(w: W, t: CipherType, key: &[u8], iv: &[u8]) -> EncryptedWriter<W> {
+    pub fn new(t: CipherType, key: &[u8], iv: &[u8]) -> EncryptedWriter {
+        // iv should be sent with the first packet
+        let mut buf = BytesMut::with_capacity(iv.len());
+        buf.put(iv);
+
         EncryptedWriter {
-            writer: w,
-            cipher: new_stream(t, key, iv, CryptoMode::Encrypt),
+            cipher: new_stream(t, key, &iv, CryptoMode::Encrypt),
+            steps: EncryptWriteStep::Nothing,
+            buf,
         }
     }
 
-    fn cipher_update<B: BufMut>(&mut self, data: &[u8], buf: &mut B) -> io::Result<()> {
-        self.cipher.update(data, buf).map_err(From::from)
+    pub fn poll_write_encrypted<W>(&mut self, ctx: &mut Context<'_>, w: &mut W, data: &[u8]) -> Poll<io::Result<usize>>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        ready!(self.poll_write_all_encrypted(ctx, w, data))?;
+        Poll::Ready(Ok(data.len()))
     }
 
-    fn cipher_finalize<B: BufMut>(&mut self, buf: &mut B) -> io::Result<()> {
-        self.cipher.finalize(buf).map_err(From::from)
-    }
-}
+    fn poll_write_all_encrypted<W>(&mut self, ctx: &mut Context<'_>, w: &mut W, data: &[u8]) -> Poll<io::Result<()>>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        // FIXME: How about finalize?
 
-impl<W> Drop for EncryptedWriter<W>
-where
-    W: AsyncWrite,
-{
-    fn drop(&mut self) {
-        let mut buf = Vec::new();
-        if let Ok(..) = self.cipher_finalize(&mut buf) {
-            if !buf.is_empty() {
-                let _ = self.write_raw(&buf);
+        loop {
+            match self.steps {
+                EncryptWriteStep::Nothing => {
+                    self.buf.reserve(self.buffer_size(data));
+                    self.cipher.update(data, &mut self.buf)?;
+                    self.steps = EncryptWriteStep::Writing;
+                }
+                EncryptWriteStep::Writing => {
+                    while self.buf.remaining() > 0 {
+                        let n = ready!(Pin::new(&mut *w).poll_write_buf(ctx, &mut self.buf))?;
+                        if n == 0 {
+                            use std::io::ErrorKind;
+                            return Poll::Ready(Err(ErrorKind::UnexpectedEof.into()));
+                        }
+                    }
+
+                    self.steps = EncryptWriteStep::Nothing;
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
-    }
-}
-
-impl<W> EncryptedWrite for EncryptedWriter<W>
-where
-    W: AsyncWrite,
-{
-    fn write_raw(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.writer.write(data)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-
-    fn encrypt<B: BufMut>(&mut self, data: &[u8], buf: &mut B) -> io::Result<()> {
-        self.cipher_update(data, buf)
     }
 
     fn buffer_size(&self, data: &[u8]) -> usize {

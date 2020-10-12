@@ -7,149 +7,126 @@
 //! *It should be notice that the extented configuration file is not suitable for the server
 //! side.*
 
-use std::{io::Result as IoResult, process};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
-use clap::{App, Arg};
-use futures::{future::Either, Future};
-use log::{debug, error, info};
-#[cfg(feature = "single-threaded")]
-use tokio::runtime::current_thread::Runtime;
-#[cfg(not(feature = "single-threaded"))]
-use tokio::runtime::Runtime;
+use clap::{clap_app, Arg};
+use futures::future::{self, Either};
+use log::info;
+use tokio::{self, runtime::Builder};
 
-use shadowsocks::{plugin::PluginConfig, run_server, Config, ConfigType, Mode, ServerAddr, ServerConfig};
+use shadowsocks::{
+    acl::AccessControl,
+    crypto::CipherType,
+    plugin::PluginConfig,
+    run_server,
+    Config,
+    ConfigType,
+    ManagerAddr,
+    ManagerConfig,
+    Mode,
+    ServerAddr,
+    ServerConfig,
+};
 
+mod allocator;
 mod logging;
 mod monitor;
+mod validator;
 
 fn main() {
-    let matches = App::new("shadowsocks")
-        .version(shadowsocks::VERSION)
-        .about("A fast tunnel proxy that helps you bypass firewalls.")
+    let available_ciphers = CipherType::available_ciphers();
+
+    let app = clap_app!(shadowsocks =>
+        (version: shadowsocks::VERSION)
+        (about: "A fast tunnel proxy that helps you bypass firewalls.")
+        (@arg VERBOSE: -v ... "Set the level of debug")
+        (@arg UDP_ONLY: -u conflicts_with[TCP_AND_UDP] "Server mode UDP_ONLY")
+        (@arg TCP_AND_UDP: -U "Server mode TCP_AND_UDP")
+
+        (@arg CONFIG: -c --config +takes_value required_unless("SERVER_ADDR") "Shadowsocks configuration file (https://shadowsocks.org/en/config/quick-guide.html)")
+
+        (@arg BIND_ADDR: -b --("bind-addr") +takes_value "Bind address, outbound socket will bind this address")
+
+        (@arg SERVER_ADDR: -s --("server-addr") +takes_value {validator::validate_server_addr} requires[PASSWORD ENCRYPT_METHOD] "Server address")
+        (@arg PASSWORD: -k --password +takes_value requires[SERVER_ADDR] "Server's password")
+        (@arg ENCRYPT_METHOD: -m --("encrypt-method") +takes_value possible_values(&available_ciphers) requires[SERVER_ADDR] "Server's encryption method")
+        (@arg TIMEOUT: --timeout +takes_value {validator::validate_u64} requires[SERVER_ADDR] "Server's timeout seconds for TCP relay")
+
+        (@arg PLUGIN: --plugin +takes_value requires[SERVER_ADDR] "SIP003 (https://shadowsocks.org/en/spec/Plugin.html) plugin")
+        (@arg PLUGIN_OPT: --("plugin-opts") +takes_value requires[PLUGIN] "Set SIP003 plugin options")
+
+        (@arg MANAGER_ADDRESS: --("manager-address") +takes_value "ShadowSocks Manager (ssmgr) address, could be \"IP:Port\", \"Domain:Port\" or \"/path/to/unix.sock\"")
+
+        (@arg NO_DELAY: --("no-delay") !takes_value "Set no-delay option for socket")
+        (@arg NOFILE: -n --nofile +takes_value "Set RLIMIT_NOFILE with both soft and hard limit (only for *nix systems)")
+        (@arg ACL: --acl +takes_value "Path to ACL (Access Control List)")
+        (@arg LOG_WITHOUT_TIME: --("log-without-time") "Log without datetime prefix")
+
+        (@arg UDP_TIMEOUT: --("udp-timeout") +takes_value {validator::validate_u64} "Timeout seconds for UDP relay")
+        (@arg UDP_MAX_ASSOCIATIONS: --("udp-max-associations") +takes_value {validator::validate_u64} "Maximum associations to be kept simultaneously for UDP relay")
+    );
+
+    let matches = app
         .arg(
-            Arg::with_name("VERBOSE")
-                .short("v")
-                .multiple(true)
-                .help("Set the level of debug"),
-        )
-        .arg(Arg::with_name("UDP_ONLY").short("u").help("Server mode UDP_ONLY"))
-        .arg(Arg::with_name("TCP_AND_UDP").short("U").help("Server mode TCP_AND_UDP"))
-        .arg(
-            Arg::with_name("CONFIG")
-                .short("c")
-                .long("config")
-                .takes_value(true)
-                .help("Specify config file"),
-        )
-        .arg(
-            Arg::with_name("SERVER_ADDR")
-                .short("s")
-                .long("server-addr")
-                .takes_value(true)
-                .help("Server address"),
-        )
-        .arg(
-            Arg::with_name("PASSWORD")
-                .short("k")
-                .long("password")
-                .takes_value(true)
-                .help("Password"),
-        )
-        .arg(
-            Arg::with_name("ENCRYPT_METHOD")
-                .short("m")
-                .long("encrypt-method")
-                .takes_value(true)
-                .help("Encryption method"),
-        )
-        .arg(
-            Arg::with_name("PLUGIN")
-                .long("plugin")
-                .takes_value(true)
-                .help("Enable SIP003 plugin"),
-        )
-        .arg(
-            Arg::with_name("PLUGIN_OPT")
-                .long("plugin-opts")
-                .takes_value(true)
-                .help("Set SIP003 plugin options"),
-        )
-        .arg(
-            Arg::with_name("LOG_WITHOUT_TIME")
-                .long("log-without-time")
-                .help("Disable time in log"),
-        )
-        .arg(
-            Arg::with_name("NO_DELAY")
-                .long("no-delay")
-                .takes_value(false)
-                .help("Set no-delay option for socket"),
-        )
-        .arg(
-            Arg::with_name("MANAGER_ADDRESS")
-                .long("manager-address")
-                .takes_value(true)
-                .help("ShadowSocks Manager (ssmgr) address"),
+            Arg::with_name("IPV6_FIRST")
+                .short("6")
+                .help("Resolve hostname to IPv6 address first"),
         )
         .get_matches();
 
-    let without_time = matches.is_present("LOG_WITHOUT_TIME");
+    drop(available_ciphers);
+
     let debug_level = matches.occurrences_of("VERBOSE");
+    logging::init(debug_level, "ssserver", matches.is_present("LOG_WITHOUT_TIME"));
 
-    logging::init(without_time, debug_level, "ssserver");
-
-    let mut has_provided_config = false;
     let mut config = match matches.value_of("CONFIG") {
         Some(cpath) => match Config::load_from_file(cpath, ConfigType::Server) {
-            Ok(cfg) => {
-                has_provided_config = true;
-                cfg
-            }
+            Ok(cfg) => cfg,
             Err(err) => {
-                error!("{:?}", err);
-                return;
+                panic!("loading config \"{}\", {}", cpath, err);
             }
         },
         None => Config::new(ConfigType::Server),
     };
 
-    let has_provided_server_config = match (
-        matches.value_of("SERVER_ADDR"),
-        matches.value_of("PASSWORD"),
-        matches.value_of("ENCRYPT_METHOD"),
-    ) {
-        (Some(svr_addr), Some(password), Some(method)) => {
-            let method = match method.parse() {
-                Ok(m) => m,
-                Err(err) => {
-                    panic!("Does not support {:?} method: {:?}", method, err);
-                }
+    if let Some(svr_addr) = matches.value_of("SERVER_ADDR") {
+        let password = matches.value_of("PASSWORD").expect("password");
+        let method = matches
+            .value_of("ENCRYPT_METHOD")
+            .expect("encrypt-method")
+            .parse::<CipherType>()
+            .expect("encryption method");
+        let svr_addr = svr_addr.parse::<ServerAddr>().expect("server-addr");
+        let timeout = matches
+            .value_of("TIMEOUT")
+            .map(|t| t.parse::<u64>().expect("timeout"))
+            .map(Duration::from_secs);
+
+        let mut sc = ServerConfig::new(svr_addr, password.to_owned(), method, timeout, None);
+
+        if let Some(p) = matches.value_of("PLUGIN") {
+            let plugin = PluginConfig {
+                plugin: p.to_owned(),
+                plugin_opts: matches.value_of("PLUGIN_OPT").map(ToOwned::to_owned),
+                plugin_args: Vec::new(),
             };
 
-            let sc = ServerConfig::new(
-                svr_addr.parse::<ServerAddr>().expect("Invalid server addr"),
-                password.to_owned(),
-                method,
-                None,
-                None,
-            );
+            sc.set_plugin(plugin);
+        }
 
-            config.server.push(sc);
-            true
-        }
-        (None, None, None) => {
-            // Does not provide server config
-            false
-        }
-        _ => {
-            panic!("`server-addr`, `method` and `password` should be provided together");
-        }
-    };
+        config.server.push(sc);
+    }
 
-    if !has_provided_config && !has_provided_server_config {
-        println!("You have to specify a configuration file or pass arguments from argument list");
-        println!("{}", matches.usage());
-        return;
+    if let Some(bind_addr) = matches.value_of("BIND_ADDR") {
+        let bind_addr = match bind_addr.parse::<IpAddr>() {
+            Ok(ip) => ServerAddr::from(SocketAddr::new(ip, 0)),
+            Err(..) => ServerAddr::from((bind_addr, 0)),
+        };
+
+        config.local_addr = Some(bind_addr);
     }
 
     if matches.is_present("UDP_ONLY") {
@@ -168,70 +145,71 @@ fn main() {
         config.no_delay = true;
     }
 
-    if let Some(p) = matches.value_of("PLUGIN") {
-        let plugin = PluginConfig {
-            plugin: p.to_owned(),
-            plugin_opt: matches.value_of("PLUGIN_OPT").map(ToOwned::to_owned),
-        };
-
-        // Overrides config in file
-        for svr in config.server.iter_mut() {
-            svr.set_plugin(plugin.clone());
-        }
-    };
-
     if let Some(m) = matches.value_of("MANAGER_ADDRESS") {
-        config.manager_address = Some(
-            m.parse::<ServerAddr>()
-                .expect("Expecting a valid ServerAddr for manager_address"),
+        config.manager = Some(ManagerConfig::new(m.parse::<ManagerAddr>().expect("manager address")));
+    }
+
+    if let Some(nofile) = matches.value_of("NOFILE") {
+        config.nofile = Some(nofile.parse::<u64>().expect("an unsigned integer for `nofile`"));
+    }
+
+    if let Some(acl_file) = matches.value_of("ACL") {
+        let acl = match AccessControl::load_from_file(acl_file) {
+            Ok(acl) => acl,
+            Err(err) => {
+                panic!("loading ACL \"{}\", {}", acl_file, err);
+            }
+        };
+        config.acl = Some(acl);
+    }
+
+    if matches.is_present("IPV6_FIRST") {
+        config.ipv6_first = true;
+    }
+
+    if let Some(udp_timeout) = matches.value_of("UDP_TIMEOUT") {
+        config.udp_timeout = Some(Duration::from_secs(udp_timeout.parse::<u64>().expect("udp-timeout")));
+    }
+
+    if let Some(udp_max_assoc) = matches.value_of("UDP_MAX_ASSOCIATIONS") {
+        config.udp_max_associations = Some(udp_max_assoc.parse::<usize>().expect("udp-max-associations"));
+    }
+
+    // DONE READING options
+
+    if config.server.is_empty() {
+        eprintln!(
+            "missing proxy servers, consider specifying it by \
+             --server-addr, --encrypt-method, --password command line option, \
+                or configuration file, check more details in https://shadowsocks.org/en/config/quick-guide.html"
         );
+        println!("{}", matches.usage());
+        return;
     }
 
-    info!("ShadowSocks {}", shadowsocks::VERSION);
+    info!("shadowsocks {}", shadowsocks::VERSION);
 
-    debug!("Config: {:?}", config);
+    let mut builder = Builder::new();
+    if cfg!(feature = "single-threaded") {
+        builder.basic_scheduler();
+    } else {
+        builder.threaded_scheduler();
+    }
+    let mut runtime = builder.enable_all().build().expect("create tokio Runtime");
+    runtime.block_on(async move {
+        let abort_signal = monitor::create_signal_monitor();
+        let server = run_server(config);
 
-    match launch_server(config) {
-        Ok(()) => {}
-        Err(err) => {
-            error!("Server exited unexpectly with error: {}", err);
-            process::exit(1);
+        tokio::pin!(abort_signal);
+        tokio::pin!(server);
+
+        match future::select(server, abort_signal).await {
+            // Server future resolved without an error. This should never happen.
+            Either::Left((Ok(..), ..)) => panic!("server exited unexpectly"),
+            // Server future resolved with error, which are listener errors in most cases
+            Either::Left((Err(err), ..)) => panic!("aborted with {}", err),
+            // The abort signal future resolved. Means we should just exit.
+            Either::Right(_) => (),
         }
-    }
-}
-
-#[cfg(not(feature = "single-threaded"))]
-fn launch_server(config: Config) -> IoResult<()> {
-    let mut runtime = Runtime::new().expect("Creating runtime");
-
-    let abort_signal = monitor::create_signal_monitor();
-    let result = runtime.block_on(run_server(config).select2(abort_signal));
-
-    runtime.shutdown_now().wait().unwrap();
-
-    match result {
-        // Server future resolved without an error. This should never happen.
-        Ok(Either::A(_)) => panic!("Server exited unexpectly"),
-        // Server future resolved with an error.
-        Err(Either::A((err, _))) => Err(err),
-        // The abort signal future resolved. Means we should just exit.
-        Ok(Either::B(..)) | Err(Either::B(..)) => Ok(()),
-    }
-}
-
-#[cfg(feature = "single-threaded")]
-fn launch_server(config: Config) -> IoResult<()> {
-    let mut runtime = Runtime::new().expect("Creating runtime");
-
-    let abort_signal = monitor::create_signal_monitor();
-    let result = runtime.block_on(run_server(config).select2(abort_signal));
-
-    match result {
-        // Server future resolved without an error. This should never happen.
-        Ok(Either::A(_)) => panic!("Server exited unexpectly"),
-        // Server future resolved with an error.
-        Err(Either::A((err, _))) => Err(err),
-        // The abort signal future resolved. Means we should just exit.
-        Ok(Either::B(..)) | Err(Either::B(..)) => Ok(()),
-    }
+    });
 }

@@ -1,70 +1,155 @@
 //! Server side
 
-use std::io;
+use std::{
+    io::{self, ErrorKind},
+    time::Duration,
+};
 
-use futures::{stream::futures_unordered, Future, Stream};
+use futures::future::{select_all, FutureExt};
+use log::{debug, error, trace, warn};
+use tokio::time;
 
 use crate::{
     config::Config,
-    context::{Context, SharedContext},
-    plugin::{launch_plugins, PluginMode},
-    relay::{boxed_future, tcprelay::server::run as run_tcp, udprelay::server::run as run_udp},
+    context::{Context, ServerState, SharedContext, SharedServerState},
+    plugin::{PluginMode, Plugins},
+    relay::{
+        flow::{MultiServerFlowStatistic, SharedMultiServerFlowStatistic},
+        manager::ManagerDatagram,
+        tcprelay::server::run as run_tcp,
+        udprelay::server::run as run_udp,
+        utils::set_nofile,
+    },
 };
 
-/// Relay server running on server side.
-///
-/// ```no_run
-/// use shadowsocks::{
-///     config::{Config, ConfigType, ServerConfig},
-///     crypto::CipherType,
-///     relay::server::run,
-/// };
-///
-/// use tokio::prelude::*;
-///
-/// let mut config = Config::new(ConfigType::Server);
-/// config.server = vec![ServerConfig::basic(
-///     "127.0.0.1:8388".parse().unwrap(),
-///     "server-password".to_string(),
-///     CipherType::Aes256Cfb,
-/// )];
-///
-/// let fut = run(config);
-/// tokio::run(fut.map_err(|err| panic!("Server run failed with error {}", err)));
-/// ```
-pub fn run(config: Config) -> impl Future<Item = (), Error = io::Error> + Send {
-    futures::lazy(move || {
-        let mut context = Context::new(config);
+/// Runs Relay server on server side.
+#[inline]
+pub async fn run(config: Config) -> io::Result<()> {
+    // Create a context containing a DNS resolver and server running state flag.
+    let server_state = ServerState::new_shared(&config).await;
 
-        let mut vf = Vec::new();
+    // Create statistics for multiple servers
+    //
+    // This is for statistic purpose for [Manage Multiple Users](https://github.com/shadowsocks/shadowsocks/wiki/Manage-Multiple-Users) APIs
+    let flow_stat = MultiServerFlowStatistic::new_shared(&config);
 
-        if context.config().mode.enable_udp() {
-            // Clone config here, because the config for TCP relay will be modified
-            // after plugins started
-            let udp_context = SharedContext::new(context.clone());
+    run_with(config, flow_stat, server_state).await
+}
 
-            // Run UDP relay before starting plugins
-            // Because plugins doesn't support UDP relay
-            let udp_fut = run_udp(udp_context);
-            vf.push(boxed_future(udp_fut));
+pub(crate) async fn run_with(
+    mut config: Config,
+    flow_stat: SharedMultiServerFlowStatistic,
+    server_stat: SharedServerState,
+) -> io::Result<()> {
+    trace!("initializing server with {:?}", config);
+
+    assert!(config.config_type.is_server());
+
+    if let Some(nofile) = config.nofile {
+        debug!("setting RLIMIT_NOFILE to {}", nofile);
+        if let Err(err) = set_nofile(nofile) {
+            match err.kind() {
+                ErrorKind::PermissionDenied => {
+                    warn!("insufficient permission to change `nofile`, try to restart as root user");
+                }
+                ErrorKind::InvalidInput => {
+                    warn!("invalid `nofile` value {}, decrease it and try again", nofile);
+                }
+                _ => {
+                    error!("failed to set RLIMIT_NOFILE with value {}, error: {}", nofile, err);
+                }
+            }
+            return Err(err);
+        }
+    }
+
+    let mode = config.mode;
+
+    let mut vf = Vec::new();
+
+    let context = if mode.enable_tcp() {
+        if config.has_server_plugins() {
+            let plugins = Plugins::launch_plugins(&mut config, PluginMode::Server).await?;
+            vf.push(plugins.boxed());
         }
 
-        if context.config().mode.enable_tcp() {
-            if let Some(plugins) =
-                launch_plugins(context.config_mut(), PluginMode::Server).expect("Failed to launch plugins")
-            {
-                vf.push(boxed_future(plugins));
-            }
+        let context = Context::new_with_state_shared(config, server_stat);
 
-            let tcp_fut = run_tcp(SharedContext::new(context));
-            vf.push(boxed_future(tcp_fut));
+        let tcp_fut = run_tcp(context.clone(), flow_stat.clone());
+        vf.push(tcp_fut.boxed());
+
+        context
+    } else {
+        Context::new_with_state_shared(config, server_stat)
+    };
+
+    if mode.enable_udp() {
+        // Run UDP relay before starting plugins
+        // Because plugins doesn't support UDP relay
+        let udp_fut = run_udp(context.clone(), flow_stat.clone());
+        vf.push(udp_fut.boxed());
+    }
+
+    // If specified manager-address, reports transmission statistic to it
+    //
+    // Dont do that if server is created by manager
+    if context.config().manager.is_some() {
+        let report_fut = manager_report_task(context.clone(), flow_stat);
+        vf.push(report_fut.boxed());
+    }
+
+    let (res, ..) = select_all(vf.into_iter()).await;
+    error!("one of servers exited unexpectly, result: {:?}", res);
+
+    // Tells all detached tasks to exit
+    context.set_server_stopped();
+
+    Err(io::Error::new(io::ErrorKind::Other, "server exited unexpectly"))
+}
+
+async fn manager_report_task(context: SharedContext, flow_stat: SharedMultiServerFlowStatistic) -> io::Result<()> {
+    let manager_config = context.config().manager.as_ref().unwrap();
+    let manager_addr = &manager_config.addr;
+    let mut socket = ManagerDatagram::bind_for(manager_addr).await?;
+
+    while context.server_running() {
+        // For each servers, send "stat" command to manager
+        //
+        // This is for compatible with managers that replies on "stat" command
+        // Ref: https://github.com/shadowsocks/shadowsocks/wiki/Manage-Multiple-Users
+        //
+        // If you are using manager in this project, this is not required.
+        for svr_cfg in &context.config().server {
+            let port = svr_cfg.addr().port();
+
+            if let Some(ref fstat) = flow_stat.get(port) {
+                let stat = format!("stat: {{\"{}\":{}}}", port, fstat.trans_stat());
+
+                match socket.send_to_manager(stat.as_bytes(), &context, &manager_addr).await {
+                    Ok(..) => {
+                        trace!(
+                            "sent {} for server \"{}\" to manger \"{}\"",
+                            stat,
+                            svr_cfg.addr(),
+                            manager_addr
+                        );
+                    }
+                    Err(err) => {
+                        error!(
+                            "failed to send {} for server \"{}\" to manager \"{}\", error: {}",
+                            stat,
+                            svr_cfg.addr(),
+                            manager_addr,
+                            err
+                        );
+                    }
+                }
+            }
         }
 
-        futures_unordered(vf).into_future().then(|res| -> io::Result<()> {
-            match res {
-                Ok(..) => Ok(()),
-                Err((err, ..)) => Err(err),
-            }
-        })
-    })
+        // Report every 10 seconds
+        time::delay_for(Duration::from_secs(10)).await;
+    }
+
+    Ok(())
 }

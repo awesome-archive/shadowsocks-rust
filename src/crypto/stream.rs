@@ -8,7 +8,9 @@ use crate::crypto::rc4_md5;
 use crate::crypto::sodium;
 use crate::crypto::{
     cipher::{CipherCategory, CipherResult, CipherType},
-    dummy, table, CryptoMode,
+    dummy,
+    table,
+    CryptoMode,
 };
 
 use bytes::BufMut;
@@ -18,8 +20,8 @@ use bytes::BufMut;
 /// The `update` method could be called multiple times, and the `finalize` method will
 /// encrypt the last block
 pub trait StreamCipher {
-    fn update(&mut self, data: &[u8], out: &mut BufMut) -> CipherResult<()>;
-    fn finalize(&mut self, out: &mut BufMut) -> CipherResult<()>;
+    fn update(&mut self, data: &[u8], out: &mut dyn BufMut) -> CipherResult<()>;
+    fn finalize(&mut self, out: &mut dyn BufMut) -> CipherResult<()>;
     fn buffer_size(&self, data: &[u8]) -> usize;
 }
 
@@ -36,12 +38,15 @@ pub fn new_stream(t: CipherType, key: &[u8], iv: &[u8], mode: CryptoMode) -> Box
 
     match t {
         CipherType::Table => Box::new(table::TableCipher::new(key, mode)),
-        CipherType::Plain => Box::new(dummy::DummyCipher),
+        CipherType::Plain | CipherType::None => Box::new(dummy::DummyCipher),
 
         #[cfg(feature = "sodium")]
         CipherType::ChaCha20 | CipherType::Salsa20 | CipherType::XSalsa20 | CipherType::ChaCha20Ietf => {
             Box::new(sodium::SodiumStreamCipher::new(t, key, iv))
         }
+
+        #[cfg(feature = "rc4")]
+        CipherType::Rc4 => Box::new(openssl::OpenSSLCipher::new(t, key, iv, mode)),
 
         #[cfg(feature = "rc4")]
         CipherType::Rc4Md5 => Box::new(rc4_md5::Rc4Md5Cipher::new(key, iv, mode)),

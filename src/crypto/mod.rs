@@ -10,14 +10,14 @@ use ::openssl::symm;
 
 pub mod aead;
 pub mod cipher;
-pub mod digest;
 pub mod dummy;
 #[cfg(feature = "openssl")]
 pub mod openssl;
 #[cfg(feature = "rc4")]
 pub mod rc4_md5;
+#[cfg(feature = "ring-aead-ciphers")]
 pub mod ring;
-#[cfg(feature = "miscreant")]
+#[cfg(feature = "aes-pmac-siv")]
 pub mod siv;
 #[cfg(feature = "sodium")]
 pub mod sodium;

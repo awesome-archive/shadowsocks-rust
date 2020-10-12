@@ -1,156 +1,128 @@
-#!/bin/sh
+#!/bin/bash
 
 CUR_DIR=$( cd $( dirname $0 ) && pwd )
 VERSION=$(grep -E '^version' ${CUR_DIR}/../Cargo.toml | awk '{print $3}' | sed 's/"//g')
-ENABLE_GZ=false
-BUILD_DOCKER_IMG=false
-BUILD_NIGHTLY=false
 
-while getopts "v:ghbn" opt; do
+## Disable macos ACL file
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    export COPYFILE_DISABLE=1
+fi
+
+targets=()
+
+while getopts "t:" opt; do
     case $opt in
-        v)
-            VERSION=$OPTARG
+        t)
+            targets+=($OPTARG)
             ;;
-        g)
-            ENABLE_GZ=true
-            ;;
-        b)
-            BUILD_DOCKER_IMG=true
-            ;;
-        n)
-            BUILD_NIGHTLY=true
-            ;;
-        h|\?)
-            echo "$0 [-v VERSION] [-g] [-h] [-b] [-n]"
-            echo "    -v VERSION        Specify VERSION in output package name"
-            echo "    -g                Enable GZip"
-            echo "    -b                Re-build docker image"
-            echo "    -n                Build with nightly rust"
-            echo "    -h                Show this image"
-            exit 0
+        ?)
+            echo "Usage: $(basename $0) [-t <target-triple>]"
             ;;
     esac
 done
 
-if $BUILD_NIGHTLY; then
-    RELEASE_NAME="nightly";
-else
-    RELEASE_NAME="stable";
+if [[ "${#targets[@]}" == "0" ]]; then
+    targets=(
+        "x86_64-unknown-linux-musl"
+        "x86_64-unknown-linux-gnu"
+
+        "x86_64-pc-windows-gnu"
+
+        "arm-unknown-linux-gnueabihf" # armhf, hard
+        "arm-unknown-linux-musleabi"  # arm, soft
+        "aarch64-unknown-linux-gnu"
+
+        "mips-unknown-linux-musl"     # big endian
+        "mipsel-unknown-linux-musl"   # little endian
+    )
 fi
 
-echo "* Building ${RELEASE_NAME} package ${VERSION} ..."
-
-if $BUILD_NIGHTLY; then
-    IMAGE='shadowsocks-rust:nightly'
-else
-    IMAGE='shadowsocks-rust:stable'
+[[ -z $upx ]] && upx="echo pending"
+if [[ $upx == "echo pending" ]] && hash upx 2>/dev/null; then
+	upx="upx -9"
 fi
 
-if [[ "$http_proxy" != "" ]]; then
-    ENV_HTTP_PROXY=$http_proxy
-elif [[ "$HTTP_PROXY" != "" ]]; then
-    ENV_HTTP_PROXY=$HTTP_PROXY
-fi
+function build() {
+    cd "$CUR_DIR/.."
 
-if [[ "$https_proxy" != "" ]]; then
-    ENV_HTTPS_PROXY=$https_proxy
-elif [[ "$HTTPS_PROXY" != "" ]]; then
-    ENV_HTTPS_PROXY=$HTTPS_PROXY
-fi
+    TARGET=$1
+    echo "* Building ${TARGET} package ${VERSION} ..."
 
-if $BUILD_DOCKER_IMG; then
-    echo "* Rebuild docker image ${IMAGE} ...";
-    if $BUILD_NIGHTLY; then
-        docker build \
-            -t "${IMAGE}" \
-            "$CUR_DIR" \
-            --build-arg TOOLCHAIN=nightly \
-            --build-arg HTTP_PROXY="$ENV_HTTP_PROXY" \
-            --build-arg HTTPS_PROXY="$ENV_HTTPS_PROXY";
-    else
-        docker build \
-            -t "${IMAGE}" \
-            "$CUR_DIR" \
-            --build-arg TOOLCHAIN=stable \
-            --build-arg HTTP_PROXY="$ENV_HTTP_PROXY" \
-            --build-arg HTTPS_PROXY="$ENV_HTTPS_PROXY";
+    RELEASE_DIR="target/${TARGET}/release"
+
+    EXTRA_FEATURES=""
+    if [[ "$TARGET" == *"-linux-"* || "$TARGET" == *"-darwin" ]]; then
+        EXTRA_FEATURES="local-redir"
     fi
-fi
 
-SRC_PATH="/home/rust/src"
-CARGO_TARGET_DIR="${SRC_PATH}/build/target"
-CARGO_INSTALL_ROOT="${SRC_PATH}/build/install"
-LOCAL_USER=$( id -u "$USER" ):$( id -g "$USER" )
-RUSTFLAGS="-Ctarget-feature=+aes,+ssse3"
+    EXTRA_FLAG=""
+    if [[ "$TARGET" == "mips"* ]]; then
+        # This is because `ring` doesn't support MIPS
+        # https://github.com/shadowsocks/shadowsocks-rust/issues/273
+        # https://github.com/briansmith/ring/issues/562
+        EXTRA_FEATURES="sodium rc4 aes-cfb aes-ctr local-http local-http-native-tls local-tunnel local-socks4 local-redir"
+        EXTRA_FLAG="--no-default-features"
+    fi
 
-TARGET_NAME="x86_64-unknown-linux-musl"
+    cross build --target "${TARGET}" \
+                --features "aes-pmac-siv openssl-vendored ${EXTRA_FEATURES}" \
+                ${EXTRA_FLAG} \
+                --release
 
-if $BUILD_NIGHTLY; then
-    ## -- BUILD nightly version
-    docker run \
-        -e CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
-        -e CARGO_INSTALL_ROOT="${CARGO_INSTALL_ROOT}" \
-        -e RUSTFLAGS="$RUSTFLAGS" \
-        -e HTTP_PROXY="$ENV_HTTP_PROXY" \
-        -e HTTPS_PROXY="$ENV_HTTPS_PROXY" \
-        -v "${CUR_DIR}"/..:"$SRC_PATH" \
-        -v "${CUR_DIR}/target/musl-builder/cargo-cache":/home/rust/.cargo/registry \
-        "${IMAGE}" \
-        /bin/bash -c \
-        "sudo mkdir -p $CARGO_TARGET_DIR \
-            && sudo rm -rf $CARGO_INSTALL_ROOT \
-            && cargo install -f --features miscreant --path . \
-            && sudo chown -R $LOCAL_USER $CARGO_INSTALL_ROOT";
-else
-    docker run \
-        -e CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
-        -e CARGO_INSTALL_ROOT="${CARGO_INSTALL_ROOT}" \
-        -e RUSTFLAGS="$RUSTFLAGS" \
-        -e HTTP_PROXY="$ENV_HTTP_PROXY" \
-        -e HTTPS_PROXY="$ENV_HTTPS_PROXY" \
-        -v "${CUR_DIR}"/..:"$SRC_PATH" \
-        -v "${CUR_DIR}/target/musl-builder/cargo-cache":/home/rust/.cargo/registry \
-        "${IMAGE}" \
-        /bin/bash -c \
-        "sudo mkdir -p $CARGO_TARGET_DIR \
-            && sudo rm -rf $CARGO_INSTALL_ROOT \
-            && cargo install -f --features miscreant --path . \
-            && sudo chown -R $LOCAL_USER $CARGO_INSTALL_ROOT";
-fi
+    if [[ $? != "0" ]]; then
+        exit $?
+    fi
 
-if [[ $? -ne "0" ]]; then
-    exit 1;
-fi
+    PKG_DIR="${CUR_DIR}/release"
+    mkdir -p "${PKG_DIR}"
 
-TARGET_DIR="$CUR_DIR/install/bin"
-cd "$TARGET_DIR"
+    if [[ "$TARGET" == *"-linux-"* ]]; then
+        PKG_NAME="shadowsocks-v${VERSION}.${TARGET}.tar.xz"
+        PKG_PATH="${PKG_DIR}/${PKG_NAME}"
 
-echo "* Finished building, target in ${TARGET_DIR}"
+        cd ${RELEASE_DIR}
 
-## Disable OS X ACL file
-export COPYFILE_DISABLE=1
+        if [[ "$TARGET" == "mips"* ]]; then
+            # Enable upx for MIPS.
+            $upx sslocal ssserver ssurl ssmanager #>/dev/null
+        fi
 
-if $ENABLE_GZ; then
-    PKG_NAME="shadowsocks-v${VERSION}-${RELEASE_NAME}.${TARGET_NAME}.tar.gz"
-    PKG_PATH="${CUR_DIR}/${PKG_NAME}"
-    echo "* Packaging GZip in ${PKG_PATH} ..."
+        echo "* Packaging XZ in ${PKG_PATH} ..."
+        tar -cJf ${PKG_PATH} \
+            "sslocal" \
+            "ssserver" \
+            "ssurl" \
+            "ssmanager"
 
-    tar -czf ${PKG_PATH} \
-        "sslocal" \
-        "ssserver" \
-        "ssurl";
+        if [[ $? != "0" ]]; then
+            exit $?
+        fi
+
+        cd "${PKG_DIR}"
+        shasum -a 256 "${PKG_NAME}" > "${PKG_NAME}.sha256"
+    elif [[ "$TARGET" == *"-windows-"* ]]; then
+        PKG_NAME="shadowsocks-v${VERSION}.${TARGET}.zip"
+        PKG_PATH="${PKG_DIR}/${PKG_NAME}"
+
+        echo "* Packaging ZIP in ${PKG_PATH} ..."
+        cd ${RELEASE_DIR}
+        zip ${PKG_PATH} \
+            "sslocal.exe" \
+            "ssserver.exe" \
+            "ssurl.exe" \
+            "ssmanager.exe"
+
+        if [[ $? != "0" ]]; then
+            exit $?
+        fi
+
+        cd "${PKG_DIR}"
+        shasum -a 256 "${PKG_NAME}" > "${PKG_NAME}.sha256"
+    fi
 
     echo "* Done build package ${PKG_NAME}"
-fi
+}
 
-PKG_NAME="shadowsocks-v${VERSION}-${RELEASE_NAME}.${TARGET_NAME}.tar.xz"
-PKG_PATH="${CUR_DIR}/${PKG_NAME}"
-echo "* Packaging XZ in ${PKG_PATH} ..."
-
-tar -cJf ${PKG_PATH} \
-    "sslocal" \
-    "ssserver" \
-    "ssurl" \
-    "ssdns"
-
-echo "* Done build package ${PKG_NAME}"
+for target in "${targets[@]}"; do
+    build "$target";
+done

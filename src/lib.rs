@@ -51,35 +51,60 @@
 //! Example to write a local server
 //!
 //! ```no_run
+//! use tokio::runtime::Runtime;
 //! use shadowsocks::{run_local, Config, ConfigType};
 //!
-//! let config = Config::load_from_file("shadowsocks.json", ConfigType::Local).unwrap();
-//! run_local(config);
+//! let mut rt = Runtime::new().expect("Failed to create runtime");
+//!
+//! let config = Config::load_from_file("shadowsocks.json", ConfigType::Socks5Local).unwrap();
+//! rt.block_on(run_local(config));
 //! ```
 //!
 //! That's all! And let me show you how to run a proxy server
 //!
 //! ```no_run
+//! use tokio::runtime::Runtime;
 //! use shadowsocks::{run_server, Config, ConfigType};
 //!
+//! let mut rt = Runtime::new().expect("Failed to create runtime");
+//!
 //! let config = Config::load_from_file("shadowsocks.json", ConfigType::Server).unwrap();
-//! run_server(config);
+//! rt.block_on(run_server(config));
 //! ```
 
 #![crate_type = "lib"]
 #![crate_name = "shadowsocks"]
 #![recursion_limit = "128"]
 
+use std::io;
+
 /// ShadowSocks version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use self::{
-    config::{ClientConfig, Config, ConfigType, Mode, ServerAddr, ServerConfig},
-    relay::{dns::run as run_dns, local::run as run_local, server::run as run_server, tcprelay::client::Socks5Client},
+    config::{ClientConfig, Config, ConfigType, ManagerAddr, ManagerConfig, Mode, ServerAddr, ServerConfig},
+    relay::{
+        local::run as run_local,
+        manager::run as run_manager,
+        server::run as run_server,
+        tcprelay::client::Socks5Client,
+    },
 };
 
+pub mod acl;
 pub mod config;
-mod context;
+pub mod context;
 pub mod crypto;
 pub mod plugin;
 pub mod relay;
+
+/// Start a ShadowSocks' server
+///
+/// For `config.config_type` in `Socks5Local`, `HttpLocal` and `TunnelLocal`, server will run in Local mode.
+pub async fn run(config: Config) -> io::Result<()> {
+    if config.config_type.is_local() {
+        run_local(config).await
+    } else {
+        run_server(config).await
+    }
+}

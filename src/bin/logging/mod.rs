@@ -1,79 +1,54 @@
-use env_logger::{fmt::Formatter, Builder};
-use log::{LevelFilter, Record};
-use std::{
-    env,
-    io::{self, Write},
-};
+use std::io::Write;
 
-pub fn init(without_time: bool, debug_level: u64, bin_name: &str) {
-    let mut log_builder = Builder::new();
-    log_builder.filter(None, LevelFilter::Info);
+use chrono::{offset::Local, SecondsFormat};
+use env_logger::Builder;
+use log::LevelFilter;
+
+pub fn init(debug_level: u64, bin_name: &str, without_time: bool) {
+    let mut log_builder = Builder::from_default_env();
+    log_builder.filter(Some(bin_name), LevelFilter::Info);
+    log_builder.filter(Some("shadowsocks"), LevelFilter::Info);
+
+    log_builder.format(move |buf, record| {
+        if !without_time {
+            write!(buf, "{} ", Local::now().to_rfc3339_opts(SecondsFormat::Millis, false))?;
+        }
+
+        write!(buf, "{:<5}", buf.default_styled_level(record.level()))?;
+
+        if debug_level > 0 {
+            if let Some(mp) = record.module_path() {
+                write!(buf, " [{}]", mp)?;
+            }
+        }
+
+        writeln!(buf, " {}", record.args())
+    });
 
     match debug_level {
         0 => {
             // Default filter
-            log_builder.format(move |fmt, r| log_time(fmt, without_time, r));
         }
         1 => {
-            let log_builder = log_builder.format(move |fmt, r| log_time_module(fmt, without_time, r));
-            log_builder.filter(Some(bin_name), LevelFilter::Debug);
-        }
-        2 => {
-            let log_builder = log_builder.format(move |fmt, r| log_time_module(fmt, without_time, r));
             log_builder
                 .filter(Some(bin_name), LevelFilter::Debug)
                 .filter(Some("shadowsocks"), LevelFilter::Debug);
         }
-        3 => {
-            let log_builder = log_builder.format(move |fmt, r| log_time_module(fmt, without_time, r));
+        2 => {
             log_builder
                 .filter(Some(bin_name), LevelFilter::Trace)
                 .filter(Some("shadowsocks"), LevelFilter::Trace);
         }
+        3 => {
+            log_builder
+                .filter(Some(bin_name), LevelFilter::Trace)
+                .filter(Some("shadowsocks"), LevelFilter::Trace)
+                .filter(None, LevelFilter::Debug);
+        }
         _ => {
-            let log_builder = log_builder.format(move |fmt, r| log_time_module(fmt, without_time, r));
             log_builder.filter(None, LevelFilter::Trace);
         }
     }
 
-    if let Ok(env_conf) = env::var("RUST_LOG") {
-        log_builder.parse_filters(&env_conf);
-    }
-
     log_builder.init();
-}
-
-fn log_time(fmt: &mut Formatter, without_time: bool, record: &Record) -> io::Result<()> {
-    if without_time {
-        writeln!(fmt, "[{}] {}", record.level(), record.args())
-    } else {
-        writeln!(
-            fmt,
-            "[{}][{}] {}",
-            time::now().strftime("%Y-%m-%d][%H:%M:%S.%f").unwrap(),
-            record.level(),
-            record.args()
-        )
-    }
-}
-
-fn log_time_module(fmt: &mut Formatter, without_time: bool, record: &Record) -> io::Result<()> {
-    if without_time {
-        writeln!(
-            fmt,
-            "[{}] [{}] {}",
-            record.level(),
-            record.module_path().unwrap_or("*"),
-            record.args()
-        )
-    } else {
-        writeln!(
-            fmt,
-            "[{}][{}] [{}] {}",
-            time::now().strftime("%Y-%m-%d][%H:%M:%S.%f").unwrap(),
-            record.level(),
-            record.module_path().unwrap_or("*"),
-            record.args()
-        )
-    }
 }

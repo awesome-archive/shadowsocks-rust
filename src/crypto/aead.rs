@@ -2,14 +2,17 @@
 
 use crate::crypto::cipher::{CipherCategory, CipherResult, CipherType};
 
+#[cfg(feature = "ring-aead-ciphers")]
 use crate::crypto::ring::RingAeadCipher;
-#[cfg(feature = "miscreant")]
+#[cfg(feature = "aes-pmac-siv")]
 use crate::crypto::siv::MiscreantCipher;
 #[cfg(feature = "sodium")]
 use crate::crypto::sodium::SodiumAeadCipher;
 
 use bytes::{Bytes, BytesMut};
-use ring::{digest::SHA1, hkdf, hmac::SigningKey};
+use cfg_if::cfg_if;
+use hkdf::Hkdf;
+use sha1::Sha1;
 
 /// Encryptor API for AEAD ciphers
 pub trait AeadEncryptor {
@@ -44,6 +47,7 @@ pub fn new_aead_encryptor(t: CipherType, key: &[u8], nonce: &[u8]) -> BoxAeadEnc
     assert!(t.category() == CipherCategory::Aead);
 
     match t {
+        #[cfg(feature = "ring-aead-ciphers")]
         CipherType::Aes128Gcm | CipherType::Aes256Gcm | CipherType::ChaCha20IetfPoly1305 => {
             Box::new(RingAeadCipher::new(t, key, nonce, true))
         }
@@ -51,7 +55,7 @@ pub fn new_aead_encryptor(t: CipherType, key: &[u8], nonce: &[u8]) -> BoxAeadEnc
         #[cfg(feature = "sodium")]
         CipherType::XChaCha20IetfPoly1305 => Box::new(SodiumAeadCipher::new(t, key, nonce)),
 
-        #[cfg(feature = "miscreant")]
+        #[cfg(feature = "aes-pmac-siv")]
         CipherType::Aes128PmacSiv | CipherType::Aes256PmacSiv => Box::new(MiscreantCipher::new(t, key, nonce)),
 
         _ => unreachable!(),
@@ -63,6 +67,7 @@ pub fn new_aead_decryptor(t: CipherType, key: &[u8], nonce: &[u8]) -> BoxAeadDec
     assert!(t.category() == CipherCategory::Aead);
 
     match t {
+        #[cfg(feature = "ring-aead-ciphers")]
         CipherType::Aes128Gcm | CipherType::Aes256Gcm | CipherType::ChaCha20IetfPoly1305 => {
             Box::new(RingAeadCipher::new(t, key, nonce, false))
         }
@@ -70,7 +75,7 @@ pub fn new_aead_decryptor(t: CipherType, key: &[u8], nonce: &[u8]) -> BoxAeadDec
         #[cfg(feature = "sodium")]
         CipherType::XChaCha20IetfPoly1305 => Box::new(SodiumAeadCipher::new(t, key, nonce)),
 
-        #[cfg(feature = "miscreant")]
+        #[cfg(feature = "aes-pmac-siv")]
         CipherType::Aes128PmacSiv | CipherType::Aes256PmacSiv => Box::new(MiscreantCipher::new(t, key, nonce)),
 
         _ => unreachable!(),
@@ -110,39 +115,197 @@ const SUBKEY_INFO: &[u8] = b"ss-subkey";
 pub fn make_skey(t: CipherType, key: &[u8], salt: &[u8]) -> Bytes {
     assert!(t.category() == CipherCategory::Aead);
 
-    let salt = SigningKey::new(&SHA1, salt);
+    let hkdf = Hkdf::<Sha1>::new(Some(salt), key);
 
     let mut skey = BytesMut::with_capacity(key.len());
     unsafe {
         skey.set_len(key.len());
     }
 
-    hkdf::extract_and_expand(&salt, key, SUBKEY_INFO, &mut skey);
+    hkdf.expand(SUBKEY_INFO, &mut skey).unwrap();
 
     skey.freeze()
 }
 
-/// Increase nonce by 1
-///
-/// AEAD ciphers requires to increase nonce after encrypt/decrypt every chunk
-#[cfg(feature = "sodium")]
-pub fn increase_nonce(nonce: &mut [u8]) {
-    use libsodium_ffi::sodium_increment;
+cfg_if! {
+    if #[cfg(feature = "sodium")] {
+        /// Increase nonce by 1
+        ///
+        /// AEAD ciphers requires to increase nonce after encrypt/decrypt every chunk (Little-Endian)
+        pub fn increase_nonce(nonce: &mut [u8]) {
+            use libsodium_sys::sodium_increment;
 
-    unsafe {
-        sodium_increment(nonce.as_mut_ptr(), nonce.len());
+            unsafe {
+                sodium_increment(nonce.as_mut_ptr(), nonce.len());
+            }
+        }
+    } else {
+        if #[cfg(target_endian = "little")] {
+            if #[cfg(target_pointer_width = "32")] {
+                /// Increase nonce by 1
+                ///
+                /// AEAD ciphers requires to increase nonce after encrypt/decrypt every chunk (Little-Endian)
+                #[inline]
+                pub fn increase_nonce(nonce: &mut [u8]) {
+                    increase_nonce_32_le(nonce);
+                }
+
+            } else if #[cfg(target_pointer_width = "64")] {
+                /// Increase nonce by 1
+                ///
+                /// AEAD ciphers requires to increase nonce after encrypt/decrypt every chunk (Little-Endian)
+                #[inline]
+                pub fn increase_nonce(nonce: &mut [u8]) {
+                    increase_nonce_64_le(nonce);
+                }
+            } else {
+                /// Increase nonce by 1
+                ///
+                /// AEAD ciphers requires to increase nonce after encrypt/decrypt every chunk (Little-Endian)
+                #[inline]
+                pub fn increase_nonce(nonce: &mut [u8]) {
+                    increase_nonce_classic_le(nonce);
+                }
+            }
+
+        } else {
+            /// Increase nonce by 1
+            ///
+            /// AEAD ciphers requires to increase nonce after encrypt/decrypt every chunk (Little-Endian)
+            #[inline]
+            pub fn increase_nonce(nonce: &mut [u8]) {
+                // Since current arthitecture is BE, integer add operations must be called after bswap operation.
+                // bswap operation in most platforms are combinations of many instructions.
+                increase_nonce_classic_le(nonce);
+            }
+        }
     }
 }
 
-/// Increase nonce by 1
-///
-/// AEAD ciphers requires to increase nonce after encrypt/decrypt every chunk
-#[cfg(not(feature = "sodium"))]
-pub fn increase_nonce(nonce: &mut [u8]) {
-    let mut prev: u16 = 1;
+#[allow(dead_code)]
+fn increase_nonce_classic_le(nonce: &mut [u8]) {
     for i in nonce {
-        prev += *i as u16;
-        *i = prev as u8;
-        prev >>= 8;
+        if u8::MAX == *i {
+            *i = 0;
+        } else {
+            *i += 1;
+            return;
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn increase_nonce_32_le(nonce: &mut [u8]) {
+    let data = nonce.as_mut_ptr();
+
+    let mut i = 0;
+    while i + 4 < nonce.len() {
+        let v = unsafe { &mut *(data.offset(i as isize) as *mut u32) };
+        if *v == u32::MAX {
+            *v = 0;
+        } else {
+            *v += 1;
+            return;
+        }
+        i += 4;
+    }
+
+    if i < nonce.len() {
+        // unlikely (missing intrinsic)
+
+        increase_nonce_classic_le(&mut nonce[i..]);
+    }
+}
+
+#[allow(dead_code)]
+fn increase_nonce_64_le(nonce: &mut [u8]) {
+    let data = nonce.as_mut_ptr();
+
+    let mut i = 0;
+    while i + 8 < nonce.len() {
+        let v = unsafe { &mut *(data.offset(i as isize) as *mut u64) };
+        if *v == u64::MAX {
+            *v = 0;
+        } else {
+            *v += 1;
+            return;
+        }
+        i += 8;
+    }
+
+    if i < nonce.len() {
+        // unlinkely (missing intrinsic)
+
+        increase_nonce_32_le(&mut nonce[i..]);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn increase_nonce_classic_le() {
+        let mut v1 = [0, 0, 0, 0];
+        super::increase_nonce_classic_le(&mut v1);
+        assert_eq!(v1, [1, 0, 0, 0]);
+
+        let mut v2 = [0xff, 0, 0, 0];
+        super::increase_nonce_classic_le(&mut v2);
+        assert_eq!(v2, [0, 1, 0, 0]);
+
+        let mut v3 = [0xff, 0xff, 0xff, 0xff];
+        super::increase_nonce_classic_le(&mut v3);
+        assert_eq!(v3, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn increase_nonce_32_le() {
+        let mut v1 = [0, 0, 0, 0];
+        super::increase_nonce_32_le(&mut v1);
+        assert_eq!(v1, [1, 0, 0, 0]);
+
+        let mut v2 = [0xff, 0, 0, 0];
+        super::increase_nonce_32_le(&mut v2);
+        assert_eq!(v2, [0, 1, 0, 0]);
+
+        let mut v3 = [0xff, 0xff, 0xff, 0xff];
+        super::increase_nonce_32_le(&mut v3);
+        assert_eq!(v3, [0, 0, 0, 0]);
+
+        let mut v4 = [0, 0, 0, 0, 0, 0];
+        super::increase_nonce_32_le(&mut v4);
+        assert_eq!(v4, [1, 0, 0, 0, 0, 0]);
+
+        let mut v5 = [0xff, 0xff, 0xff, 0xff, 0, 0];
+        super::increase_nonce_32_le(&mut v5);
+        assert_eq!(v5, [0, 0, 0, 0, 1, 0]);
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn increase_nonce_64_le() {
+        let mut v1 = [0, 0, 0, 0, 0, 0, 0, 0];
+        super::increase_nonce_64_le(&mut v1);
+        assert_eq!(v1, [1, 0, 0, 0, 0, 0, 0, 0]);
+
+        let mut v2 = [0xff, 0, 0, 0, 0, 0, 0, 0];
+        super::increase_nonce_64_le(&mut v2);
+        assert_eq!(v2, [0, 1, 0, 0, 0, 0, 0, 0]);
+
+        let mut v3 = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        super::increase_nonce_64_le(&mut v3);
+        assert_eq!(v3, [0, 0, 0, 0, 0, 0, 0, 0]);
+
+        let mut v4 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        super::increase_nonce_64_le(&mut v4);
+        assert_eq!(v4, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        let mut v5 = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0];
+        super::increase_nonce_64_le(&mut v5);
+        assert_eq!(v5, [0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+
+        let mut v6 = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0];
+        super::increase_nonce_64_le(&mut v6);
+        assert_eq!(v6, [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
     }
 }

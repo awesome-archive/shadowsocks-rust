@@ -1,13 +1,17 @@
 [package]
 name = "shadowsocks-rust"
-version = "1.7.2"
-authors = ["Y. T. CHUNG <zonyitoo@gmail.com>"]
+version = "1.8.20"
+authors = ["Shadowsocks Contributors"]
 description = "shadowsocks is a fast tunnel proxy that helps you bypass firewalls."
-repository = "https://github.com/zonyitoo/shadowsocks-rust"
+repository = "https://github.com/shadowsocks/shadowsocks-rust"
+readme = "README.md"
 documentation = "https://docs.rs/shadowsocks-rust"
 keywords = ["shadowsocks", "proxy", "socks", "socks5", "firewall"]
 license = "MIT"
 edition = "2018"
+
+[badges]
+maintenance = { status = "passively-maintained" }
 
 [lib]
 name = "shadowsocks"
@@ -25,55 +29,124 @@ name = "ssurl"
 path = "src/bin/ssurl.rs"
 
 [[bin]]
-name = "ssdns"
-path = "src/bin/ssdns.rs"
+name = "ssmanager"
+path = "src/bin/manager.rs"
 
 [profile.release]
-lto = true
+lto = "fat"
+codegen-units = 1
+incremental = false
+panic = "abort"
 
 [features]
-default = ["sodium", "rc4", "aes-cfb", "aes-ctr"]
-sodium = ["libsodium-ffi"]
+default = ["ring-aead-ciphers", "sodium", "rc4", "aes-cfb", "aes-ctr", "trust-dns", "local-http", "local-http-rustls", "local-tunnel", "local-socks4"]
+# Enables AEAD ciphers that depending on ring
+# aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305
+ring-aead-ciphers = ["ring"]
+# Enables ciphers that depending on libsodium
+# chacha20, xchacha20, chacha20-ietf
+# salsa20, xsalsa20
+# xchacha20-ietf-poly1305
+sodium = ["libsodium-sys"]
 rc4 = ["openssl"]
 aes-cfb = ["openssl"]
 aes-ctr = ["openssl"]
+aes-pmac-siv = ["miscreant"]
 camellia-cfb = ["openssl"]
+# Uses single-threaded scheduler instead of default multi-threaded
 single-threaded = []
+# Enables trust-dns for replacing tokio's builtin DNS resolver
+trust-dns = ["trust-dns-resolver"]
+dns-over-tls = ["trust-dns", "trust-dns-resolver/dns-over-rustls"]
+dns-over-https = ["trust-dns", "trust-dns-resolver/dns-over-https-rustls"]
+# Enable vendored OpenSSL
+# rust-openssl tries to find OpenSSL system-wide by default,
+# by enabling this feature will try to build or use prebuilt OpenSSL libraries
+openssl-vendored = ["native-tls/vendored", "openssl/vendored"]
+# Enable DNS-relay
+# Currently is only used in Android
+local-dns-relay = []
+# Enable client flow statistic report
+# Currently is only used in Android
+local-flow-stat = []
+# Enable HTTP protocol for sslocal
+local-http = ["hyper", "http", "tower"]
+local-http-native-tls = ["tokio-native-tls", "native-tls"]
+local-http-rustls = ["tokio-rustls", "webpki-roots", "rustls-native-certs"]
+# Enable REDIR protocol for sslocal
+# (transparent proxy)
+local-redir = []
+# Enable tunnel protocol for sslocal
+local-tunnel = []
+# Enable SOCKS4/4a protocol for sslocal
+local-socks4 = []
+# Enable jemalloc for binaries
+jemalloc = ["jemallocator"]
+# Enable bundled tcmalloc
+tcmalloc-vendored = ["tcmalloc/bundled"]
 
 [dependencies]
 log = "0.4"
-byteorder = "1.3"
 rand = "0.7"
-time = "0.1"
-clap = "2.33"
-env_logger = "0.6"
+clap = { version = "2.33", features = ["suggestions", "wrap_help"] }
+env_logger = { version = "0.7", default-features = false, features = ["termcolor", "atty", "regex"] }
+chrono = "0.4"
 openssl = { version = "0.10", optional = true }
-libc = "0.2"
-futures = "0.1"
-tokio-io = "0.1"
-tokio = "0.1"
+libc = "^0.2.68"
+tokio = { version = "^0.2.11", features = ["macros", "net", "signal", "time", "sync", "process", "rt-threaded", "rt-core", "stream", "io-util", "parking_lot"] }
+tokio-native-tls = { version = "0.1", optional = true }
+native-tls = { version = "0.2", optional = true }
+tokio-rustls = { version = "0.13", optional = true }
+webpki-roots = { version = "0.19", optional = true }
+rustls-native-certs = { version = "0.3", optional = true }
+futures = "0.3"
 json5 = "0.2"
-base64 = "0.10"
-bytes = "0.4"
-ring = "0.14"
+base64 = "0.12"
+bytes = "0.5"
+byteorder = "1"
+ring = { version = "0.16", optional = true }
 md-5 = "0.8"
 digest = "0.8"
-typenum = "1.10"
-qrcode = { version = "0.10", default-features = false }
-serde_urlencoded = "0.5"
+typenum = "1.11"
+qrcode = { version = "0.12", default-features = false }
+serde_urlencoded = "0.6"
 serde = { version = "1.0", features = ["derive"] }
-url = "2.0"
+url = "2.1"
 byte_string = "1.0"
-libsodium-ffi = { version = "0.1", optional = true }
-miscreant = { version = "0.4", optional = true }
-lru-cache = "0.1"
-dns-parser = "0.8"
-trust-dns-resolver = { version = "0.11", features = ["dns-over-rustls", "dns-over-https-rustls"] }
-spin = { version = "0.5", default-features = false }
-tokio-process = "0.2"
-
-[target.'cfg(unix)'.dependencies]
-tokio-signal = "0.2"
+libsodium-sys = { version = "0.2", optional = true }
+miscreant = { version = "0.5", default-features = false, features = ["std", "pmac"], optional = true }
+trust-dns-resolver = { version = "0.19", optional = true }
+trust-dns-proto = "0.19"
+hkdf = "0.8"
+hmac = "0.7"
+sha-1 = "0.8"
+lru_time_cache = "0.10"
+hyper = { version = "0.13", optional = true }
+http = { version = "0.2", optional = true }
+tower = { version = "0.3", optional = true }
+pin-project = "0.4.17"
+socket2 = "0.3"
+cfg-if = "0.1"
+bloomfilter = "^1.0.2"
+spin = "0.5"
+# mio = { version = "0.7", features = ["udp"] }
+mio = "0.6"
+mio-uds = "0.6"
+serde_json = "1.0"
+regex = "1"
+strum = "0.18"
+strum_macros = "0.18"
+iprange = "^0.6.3"
+ipnet = "2.2"
+async-trait = "0.1"
+lazy_static = "1.4"
+jemallocator = { version = "0.3", optional = true }
+mimalloc = { version = "0.1", optional = true }
+tcmalloc = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-tokio-signal = "0.2"
+winapi = { version = "0.3", features = ["mswsock", "winsock2"] }
+
+# Just for the ioctl call macro
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+nix = "0.17"

@@ -4,183 +4,268 @@
 //! or you could specify a configuration file. The format of configuration file is defined
 //! in mod `config`.
 
-use std::{io::Result as IoResult, net::SocketAddr, process};
+use std::time::Duration;
 
-use clap::{App, Arg};
-use futures::{future::Either, Future};
-use log::{debug, error, info};
-#[cfg(feature = "single-threaded")]
-use tokio::runtime::current_thread::Runtime;
-#[cfg(not(feature = "single-threaded"))]
-use tokio::runtime::Runtime;
+use clap::{clap_app, Arg};
+use futures::future::{self, Either};
+use log::info;
+use tokio::{self, runtime::Builder};
 
-use shadowsocks::{plugin::PluginConfig, run_local, Config, ConfigType, Mode, ServerAddr, ServerConfig};
+#[cfg(feature = "local-redir")]
+use shadowsocks::config::RedirType;
+use shadowsocks::{
+    acl::AccessControl,
+    crypto::CipherType,
+    plugin::PluginConfig,
+    relay::socks5::Address,
+    run_local,
+    Config,
+    ConfigType,
+    Mode,
+    ServerAddr,
+    ServerConfig,
+};
 
+mod allocator;
 mod logging;
 mod monitor;
+mod validator;
+
+const AVAILABLE_PROTOCOLS: &[&str] = &[
+    "socks5",
+    #[cfg(feature = "local-socks4")]
+    "socks4",
+    #[cfg(feature = "local-http")]
+    "http",
+    #[cfg(all(
+        feature = "local-http",
+        any(feature = "local-http-native-tls", feature = "local-http-rustls")
+    ))]
+    "https",
+    #[cfg(feature = "local-tunnel")]
+    "tunnel",
+    #[cfg(feature = "local-redir")]
+    "redir",
+];
 
 fn main() {
-    let matches = App::new("shadowsocks")
-        .version(shadowsocks::VERSION)
-        .about("A fast tunnel proxy that helps you bypass firewalls.")
-        .arg(
-            Arg::with_name("VERBOSE")
-                .short("v")
-                .multiple(true)
-                .help("Set the level of debug"),
-        )
-        .arg(Arg::with_name("UDP_ONLY").short("u").help("Server mode UDP_ONLY"))
-        .arg(Arg::with_name("TCP_AND_UDP").short("U").help("Server mode TCP_AND_UDP"))
-        .arg(
-            Arg::with_name("CONFIG")
-                .short("c")
-                .long("config")
-                .takes_value(true)
-                .help("Specify config file"),
-        )
-        .arg(
-            Arg::with_name("SERVER_ADDR")
-                .short("s")
-                .long("server-addr")
-                .takes_value(true)
-                .help("Server address"),
-        )
-        .arg(
-            Arg::with_name("LOCAL_ADDR")
-                .short("b")
-                .long("local-addr")
-                .takes_value(true)
-                .help("Local address, listen only to this address if specified"),
-        )
-        .arg(
-            Arg::with_name("PASSWORD")
-                .short("k")
-                .long("password")
-                .takes_value(true)
-                .help("Password"),
-        )
-        .arg(
-            Arg::with_name("ENCRYPT_METHOD")
-                .short("m")
-                .long("encrypt-method")
-                .takes_value(true)
-                .help("Encryption method"),
-        )
-        .arg(
-            Arg::with_name("PLUGIN")
-                .long("plugin")
-                .takes_value(true)
-                .help("Enable SIP003 plugin"),
-        )
-        .arg(
-            Arg::with_name("PLUGIN_OPT")
-                .long("plugin-opts")
-                .takes_value(true)
-                .help("Set SIP003 plugin options"),
-        )
-        .arg(
-            Arg::with_name("LOG_WITHOUT_TIME")
-                .long("log-without-time")
-                .help("Disable time in log"),
-        )
-        .arg(
-            Arg::with_name("URL")
-                .long("server-url")
-                .takes_value(true)
-                .help("Server address in SIP002 URL"),
-        )
-        .arg(
-            Arg::with_name("NO_DELAY")
-                .long("no-delay")
-                .takes_value(false)
-                .help("Set no-delay option for socket"),
-        )
-        .get_matches();
+    let available_ciphers = CipherType::available_ciphers();
 
-    let without_time = matches.is_present("LOG_WITHOUT_TIME");
+    let mut app = clap_app!(shadowsocks =>
+        (version: shadowsocks::VERSION)
+        (about: "A fast tunnel proxy that helps you bypass firewalls.")
+        (@arg VERBOSE: -v ... "Set the level of debug")
+        (@arg UDP_ONLY: -u conflicts_with[TCP_AND_UDP] "Server mode UDP_ONLY")
+        (@arg TCP_AND_UDP: -U "Server mode TCP_AND_UDP")
+
+        (@arg CONFIG: -c --config +takes_value required_unless_all(&["LOCAL_ADDR", "SERVER_CONFIG"]) "Shadowsocks configuration file (https://shadowsocks.org/en/config/quick-guide.html)")
+
+        (@arg LOCAL_ADDR: -b --("local-addr") +takes_value {validator::validate_server_addr} "Local address, listen only to this address if specified")
+
+        (@arg SERVER_ADDR: -s --("server-addr") +takes_value {validator::validate_server_addr} requires[PASSWORD ENCRYPT_METHOD] "Server address")
+        (@arg PASSWORD: -k --password +takes_value requires[SERVER_ADDR] "Server's password")
+        (@arg ENCRYPT_METHOD: -m --("encrypt-method") +takes_value possible_values(&available_ciphers) requires[SERVER_ADDR] +next_line_help "Server's encryption method")
+        (@arg TIMEOUT: --timeout +takes_value {validator::validate_u64} requires[SERVER_ADDR] "Server's timeout seconds for TCP relay")
+
+        (@arg PLUGIN: --plugin +takes_value requires[SERVER_ADDR] "SIP003 (https://shadowsocks.org/en/spec/Plugin.html) plugin")
+        (@arg PLUGIN_OPT: --("plugin-opts") +takes_value requires[PLUGIN] "Set SIP003 plugin options")
+
+        (@arg URL: --("server-url") +takes_value {validator::validate_server_url} "Server address in SIP002 (https://shadowsocks.org/en/spec/SIP002-URI-Scheme.html) URL")
+
+        (@group SERVER_CONFIG =>
+            (@attributes +multiple arg[SERVER_ADDR URL]))
+
+        (@arg FORWARD_ADDR: -f --("forward-addr") +takes_value {validator::validate_address} required_if("PROTOCOL", "tunnel") "Forwarding data directly to this address (for tunnel)")
+
+        (@arg PROTOCOL: --protocol +takes_value default_value("socks5") possible_values(AVAILABLE_PROTOCOLS) +next_line_help "Protocol that for communicating with clients")
+
+        (@arg NO_DELAY: --("no-delay") !takes_value "Set no-delay option for socket")
+        (@arg NOFILE: -n --nofile +takes_value "Set RLIMIT_NOFILE with both soft and hard limit (only for *nix systems)")
+        (@arg ACL: --acl +takes_value "Path to ACL (Access Control List)")
+        (@arg LOG_WITHOUT_TIME: --("log-without-time") "Log without datetime prefix")
+
+        (@arg UDP_TIMEOUT: --("udp-timeout") +takes_value {validator::validate_u64} "Timeout seconds for UDP relay")
+        (@arg UDP_MAX_ASSOCIATIONS: --("udp-max-associations") +takes_value {validator::validate_u64} "Maximum associations to be kept simultaneously for UDP relay")
+
+        (@arg UDP_BIND_ADDR: --("udp-bind-addr") +takes_value {validator::validate_server_addr} "UDP relay's bind address, default is the same as local-addr")
+    );
+
+    // FIXME: -6 is not a identifier, so we cannot build it with clap_app!
+    app = app.arg(
+        Arg::with_name("IPV6_FIRST")
+            .short("6")
+            .help("Resolve hostname to IPv6 address first"),
+    );
+
+    #[cfg(feature = "local-redir")]
+    {
+        let available_redir_types = RedirType::available_types();
+
+        if RedirType::tcp_default() != RedirType::NotSupported {
+            app = clap_app!(@app (app)
+                (@arg TCP_REDIR: --("tcp-redir") +takes_value possible_values(&available_redir_types) default_value(RedirType::tcp_default().name()) "TCP redir (transparent proxy) type")
+            );
+        }
+
+        if RedirType::udp_default() != RedirType::NotSupported {
+            app = clap_app!(@app (app)
+                (@arg UDP_REDIR: --("udp-redir") +takes_value possible_values(&available_redir_types) default_value(RedirType::udp_default().name()) "UDP redir (transparent proxy) type")
+            );
+        }
+    }
+
+    if cfg!(target_os = "android") {
+        app = clap_app!(@app (app)
+            (@arg VPN_MODE: --vpn "Enable VPN mode (only for Android)")
+        );
+    }
+
+    #[cfg(feature = "local-flow-stat")]
+    {
+        app = clap_app!(@app (app)
+            (@arg STAT_PATH: --("stat-path") +takes_value "Specify stat_path for traffic stat (only for Android)")
+        );
+    }
+
+    #[cfg(feature = "local-dns-relay")]
+    {
+        app = clap_app!(@app (app)
+            (@arg LOCAL_DNS_ADDR: --("local-dns") +takes_value {validator::validate_socket_addr} "Specify the address of local DNS server (only for Android)")
+            (@arg REMOTE_DNS_ADDR: --("remote-dns") +takes_value {validator::validate_address} "Specify the address of remote DNS server (only for Android)")
+            (@arg DNS_LOCAL_ADDR: --("dns-relay") +takes_value {validator::validate_server_addr} "Specify the address of DNS relay (only for Android)")
+        );
+    }
+
+    #[cfg(feature = "local-http-native-tls")]
+    {
+        app = clap_app!(@app (app)
+            (@arg TLS_IDENTITY_PATH: --("tls-identity") +takes_value required_if("PROTOCOL", "https") requires[TLS_IDENTITY_PASSWORD] "TLS identity file (PKCS #12) path for HTTPS server")
+            (@arg TLS_IDENTITY_PASSWORD: --("tls-identity-password") +takes_value required_if("PROTOCOL", "https") requires[TLS_IDENTITY_PATH] "TLS identity file's password for HTTPS server")
+        );
+    }
+
+    #[cfg(feature = "local-http-rustls")]
+    {
+        app = clap_app!(@app (app)
+            (@arg TLS_IDENTITY_CERT_PATH: --("tls-identity-certificate") +takes_value required_if("PROTOCOL", "https") requires[TLS_IDENTITY_PRIVATE_KEY_PATH] "TLS identity certificate (PEM) path for HTTPS server")
+            (@arg TLS_IDENTITY_PRIVATE_KEY_PATH: --("tls-identity-private-key") +takes_value required_if("PROTOCOL", "https") requires[TLS_IDENTITY_CERT_PATH] "TLS identity private key (PEM), PKCS #8 or RSA syntax, for HTTPS server")
+        );
+    }
+
+    let matches = app.get_matches();
+    drop(available_ciphers);
+
     let debug_level = matches.occurrences_of("VERBOSE");
+    logging::init(debug_level, "sslocal", matches.is_present("LOG_WITHOUT_TIME"));
 
-    logging::init(without_time, debug_level, "sslocal");
-
-    let mut has_provided_config = false;
+    let config_type = match matches.value_of("PROTOCOL") {
+        Some("socks5") => ConfigType::Socks5Local,
+        #[cfg(feature = "local-socks4")]
+        Some("socks4") => ConfigType::Socks4Local,
+        #[cfg(feature = "local-http")]
+        Some("http") => ConfigType::HttpLocal,
+        #[cfg(all(
+            feature = "local-http",
+            any(feature = "local-http-native-tls", feature = "local-http-rustls")
+        ))]
+        Some("https") => ConfigType::HttpsLocal,
+        #[cfg(feature = "local-tunnel")]
+        Some("tunnel") => ConfigType::TunnelLocal,
+        #[cfg(feature = "local-redir")]
+        Some("redir") => ConfigType::RedirLocal,
+        Some(p) => panic!("not supported `protocol` \"{}\"", p),
+        None => ConfigType::Socks5Local,
+    };
 
     let mut config = match matches.value_of("CONFIG") {
-        Some(cpath) => match Config::load_from_file(cpath, ConfigType::Local) {
-            Ok(cfg) => {
-                has_provided_config = true;
-                cfg
-            }
+        Some(cpath) => match Config::load_from_file(cpath, config_type) {
+            Ok(cfg) => cfg,
             Err(err) => {
-                error!("{:?}", err);
-                return;
+                panic!("loading config \"{}\", {}", cpath, err);
             }
         },
-        None => Config::new(ConfigType::Local),
+        None => Config::new(config_type),
     };
 
-    let mut has_provided_server_config = match (
-        matches.value_of("SERVER_ADDR"),
-        matches.value_of("PASSWORD"),
-        matches.value_of("ENCRYPT_METHOD"),
-    ) {
-        (Some(svr_addr), Some(password), Some(method)) => {
-            let method = match method.parse() {
-                Ok(m) => m,
-                Err(err) => {
-                    panic!("Does not support {:?} method: {:?}", method, err);
-                }
+    if let Some(svr_addr) = matches.value_of("SERVER_ADDR") {
+        let password = matches.value_of("PASSWORD").expect("password");
+        let method = matches
+            .value_of("ENCRYPT_METHOD")
+            .expect("encrypt-method")
+            .parse::<CipherType>()
+            .expect("encryption method");
+        let svr_addr = svr_addr.parse::<ServerAddr>().expect("server-addr");
+
+        let timeout = matches
+            .value_of("TIMEOUT")
+            .map(|t| t.parse::<u64>().expect("timeout"))
+            .map(Duration::from_secs);
+
+        let mut sc = ServerConfig::new(svr_addr, password.to_owned(), method, timeout, None);
+
+        if let Some(p) = matches.value_of("PLUGIN") {
+            let plugin = PluginConfig {
+                plugin: p.to_owned(),
+                plugin_opts: matches.value_of("PLUGIN_OPT").map(ToOwned::to_owned),
+                plugin_args: Vec::new(),
             };
 
-            let sc = ServerConfig::new(
-                svr_addr.parse::<ServerAddr>().expect("Invalid server addr"),
-                password.to_owned(),
-                method,
-                None,
-                None,
-            );
+            sc.set_plugin(plugin);
+        }
 
-            config.server.push(sc);
-            true
-        }
-        (None, None, None) => {
-            // Does not provide server config
-            false
-        }
-        _ => {
-            panic!("`server-addr`, `method` and `password` should be provided together");
-        }
-    };
+        config.server.push(sc);
+    }
 
     if let Some(url) = matches.value_of("URL") {
-        let svr_addr = url.parse::<ServerConfig>().expect("Failed to parse `url`");
-
-        has_provided_server_config = true;
-
+        let svr_addr = url.parse::<ServerConfig>().expect("server SIP002 url");
         config.server.push(svr_addr);
     }
 
-    let has_provided_local_config = match matches.value_of("LOCAL_ADDR") {
-        Some(local_addr) => {
-            let local_addr: SocketAddr = local_addr.parse().expect("`local-addr` is not a valid IP address");
+    if cfg!(target_os = "android") {
+        config.local_dns_path = Some(From::from("local_dns_path"));
 
-            config.local = Some(local_addr);
-            true
+        if matches.is_present("VPN_MODE") {
+            // A socket `protect_path` in CWD
+            // Same as shadowsocks-libev's android.c
+            config.protect_path = Some(From::from("protect_path"));
         }
-        None => false,
-    };
-
-    if !has_provided_config && !(has_provided_server_config && has_provided_local_config) {
-        println!("You have to specify a configuration file or pass arguments by argument list");
-        println!("{}", matches.usage());
-        return;
     }
 
-    if matches.is_present("UDP_ONLY") {
-        if config.mode.enable_tcp() {
-            config.mode = Mode::TcpAndUdp;
-        } else {
-            config.mode = Mode::UdpOnly;
+    #[cfg(feature = "local-flow-stat")]
+    {
+        if let Some(stat_path) = matches.value_of("STAT_PATH") {
+            config.stat_path = Some(From::from(stat_path));
         }
+    }
+
+    #[cfg(feature = "local-dns-relay")]
+    {
+        use std::net::SocketAddr;
+
+        if let Some(local_dns_addr) = matches.value_of("LOCAL_DNS_ADDR") {
+            let addr = local_dns_addr.parse::<SocketAddr>().expect("local dns address");
+            config.local_dns_addr = Some(addr);
+        }
+
+        if let Some(remote_dns_addr) = matches.value_of("REMOTE_DNS_ADDR") {
+            let addr = remote_dns_addr.parse::<Address>().expect("remote dns address");
+            config.remote_dns_addr = Some(addr);
+        }
+
+        if let Some(dns_relay_addr) = matches.value_of("DNS_LOCAL_ADDR") {
+            let addr = dns_relay_addr.parse::<ServerAddr>().expect("dns relay address");
+            config.dns_local_addr = Some(addr);
+        }
+    }
+
+    if let Some(local_addr) = matches.value_of("LOCAL_ADDR") {
+        let local_addr = local_addr.parse::<ServerAddr>().expect("local bind addr");
+        config.local_addr = Some(local_addr);
+    }
+
+    // override the config's mode if UDP_ONLY is set
+    if matches.is_present("UDP_ONLY") {
+        config.mode = Mode::UdpOnly;
     }
 
     if matches.is_present("TCP_AND_UDP") {
@@ -191,63 +276,119 @@ fn main() {
         config.no_delay = true;
     }
 
-    if let Some(p) = matches.value_of("PLUGIN") {
-        let plugin = PluginConfig {
-            plugin: p.to_owned(),
-            plugin_opt: matches.value_of("PLUGIN_OPT").map(ToOwned::to_owned),
+    if let Some(nofile) = matches.value_of("NOFILE") {
+        config.nofile = Some(nofile.parse::<u64>().expect("an unsigned integer for `nofile`"));
+    }
+
+    if let Some(acl_file) = matches.value_of("ACL") {
+        let acl = match AccessControl::load_from_file(acl_file) {
+            Ok(acl) => acl,
+            Err(err) => {
+                panic!("loading ACL \"{}\", {}", acl_file, err);
+            }
         };
+        config.acl = Some(acl);
+    }
 
-        // Overrides config in file
-        for svr in config.server.iter_mut() {
-            svr.set_plugin(plugin.clone());
+    if matches.is_present("IPV6_FIRST") {
+        config.ipv6_first = true;
+    }
+
+    if let Some(faddr) = matches.value_of("FORWARD_ADDR") {
+        let addr = faddr.parse::<Address>().expect("forward-addr");
+        config.forward = Some(addr);
+    }
+
+    #[cfg(feature = "local-redir")]
+    {
+        if let Some(tcp_redir) = matches.value_of("TCP_REDIR") {
+            config.tcp_redir = tcp_redir.parse::<RedirType>().expect("TCP redir type");
         }
-    };
 
-    info!("ShadowSocks {}", shadowsocks::VERSION);
-
-    debug!("Config: {:?}", config);
-
-    match launch_server(config) {
-        Ok(()) => {}
-        Err(err) => {
-            error!("Server exited unexpectly with error: {}", err);
-            process::exit(1);
+        if let Some(udp_redir) = matches.value_of("UDP_REDIR") {
+            config.udp_redir = udp_redir.parse::<RedirType>().expect("UDP redir type");
         }
     }
-}
 
-#[cfg(feature = "single-threaded")]
-fn launch_server(config: Config) -> IoResult<()> {
-    let mut runtime = Runtime::new().expect("Creating runtime");
+    #[cfg(feature = "local-http-native-tls")]
+    {
+        if let Some(ipath) = matches.value_of("TLS_IDENTITY_PATH") {
+            config.tls_identity_path = Some(ipath.into());
+        }
 
-    let abort_signal = monitor::create_signal_monitor();
-    let result = runtime.block_on(run_local(config).select2(abort_signal));
-
-    match result {
-        // Server future resolved without an error. This should never happen.
-        Ok(Either::A(_)) => panic!("Server exited unexpectly"),
-        // Server future resolved with an error.
-        Err(Either::A((err, _))) => Err(err),
-        // The abort signal future resolved. Means we should just exit.
-        Ok(Either::B(..)) | Err(Either::B(..)) => Ok(()),
+        if let Some(ipwd) = matches.value_of("TLS_IDENTITY_PASSWORD") {
+            config.tls_identity_password = Some(ipwd.into());
+        }
     }
-}
 
-#[cfg(not(feature = "single-threaded"))]
-fn launch_server(config: Config) -> IoResult<()> {
-    let mut runtime = Runtime::new().expect("Creating runtime");
+    #[cfg(feature = "local-http-rustls")]
+    {
+        if let Some(cpath) = matches.value_of("TLS_IDENTITY_CERT_PATH") {
+            config.tls_identity_certificate_path = Some(cpath.into());
+        }
 
-    let abort_signal = monitor::create_signal_monitor();
-    let result = runtime.block_on(run_local(config).select2(abort_signal));
-
-    runtime.shutdown_now().wait().unwrap();
-
-    match result {
-        // Server future resolved without an error. This should never happen.
-        Ok(Either::A(_)) => panic!("Server exited unexpectly"),
-        // Server future resolved with an error.
-        Err(Either::A((err, _))) => Err(err),
-        // The abort signal future resolved. Means we should just exit.
-        Ok(Either::B(..)) | Err(Either::B(..)) => Ok(()),
+        if let Some(kpath) = matches.value_of("TLS_IDENTITY_PRIVATE_KEY_PATH") {
+            config.tls_identity_private_key_path = Some(kpath.into());
+        }
     }
+
+    if let Some(udp_timeout) = matches.value_of("UDP_TIMEOUT") {
+        config.udp_timeout = Some(Duration::from_secs(udp_timeout.parse::<u64>().expect("udp-timeout")));
+    }
+
+    if let Some(udp_max_assoc) = matches.value_of("UDP_MAX_ASSOCIATIONS") {
+        config.udp_max_associations = Some(udp_max_assoc.parse::<usize>().expect("udp-max-associations"));
+    }
+
+    if let Some(udp_bind_addr) = matches.value_of("UDP_BIND_ADDR") {
+        config.udp_bind_addr = Some(udp_bind_addr.parse::<ServerAddr>().expect("udp-bind-addr"));
+    }
+
+    // DONE READING options
+
+    if config.local_addr.is_none() {
+        eprintln!(
+            "missing `local_address`, consider specifying it by --local-addr command line option, \
+             or \"local_address\" and \"local_port\" in configuration file"
+        );
+        println!("{}", matches.usage());
+        return;
+    }
+
+    if config.server.is_empty() {
+        eprintln!(
+            "missing proxy servers, consider specifying it by \
+             --server-addr, --encrypt-method, --password command line option, \
+                or --server-url command line option, \
+                or configuration file, check more details in https://shadowsocks.org/en/config/quick-guide.html"
+        );
+        println!("{}", matches.usage());
+        return;
+    }
+
+    info!("shadowsocks {}", shadowsocks::VERSION);
+
+    let mut builder = Builder::new();
+    if cfg!(feature = "single-threaded") {
+        builder.basic_scheduler();
+    } else {
+        builder.threaded_scheduler();
+    }
+    let mut runtime = builder.enable_all().build().expect("create tokio Runtime");
+    runtime.block_on(async move {
+        let abort_signal = monitor::create_signal_monitor();
+        let server = run_local(config);
+
+        tokio::pin!(abort_signal);
+        tokio::pin!(server);
+
+        match future::select(server, abort_signal).await {
+            // Server future resolved without an error. This should never happen.
+            Either::Left((Ok(..), ..)) => panic!("server exited unexpectly"),
+            // Server future resolved with error, which are listener errors in most cases
+            Either::Left((Err(err), ..)) => panic!("aborted with {}", err),
+            // The abort signal future resolved. Means we should just exit.
+            Either::Right(_) => (),
+        }
+    });
 }

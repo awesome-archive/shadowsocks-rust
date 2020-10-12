@@ -3,18 +3,22 @@
 use std::{
     convert::From,
     fmt::{self, Debug, Display},
-    io, mem,
+    io,
     str::{self, FromStr},
 };
 
-use crate::crypto::digest::{self, Digest, DigestType};
 use bytes::{BufMut, Bytes, BytesMut};
+use digest::Digest;
+use md5::Md5;
 #[cfg(feature = "camellia-cfb")]
 use openssl::nid::Nid;
 #[cfg(feature = "openssl")]
 use openssl::symm;
 use rand::{self, RngCore};
+#[cfg(feature = "ring-aead-ciphers")]
 use ring::aead::{AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305};
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
 
 /// Cipher result
 pub type CipherResult<T> = Result<T, Error>;
@@ -50,7 +54,7 @@ impl Display for Error {
             Error::OpenSSLError(ref err) => write!(f, "{}", err),
             Error::IoError(ref err) => write!(f, "{}", err),
             Error::AeadDecryptFailed => write!(f, "AeadDecryptFailed"),
-            Error::SodiumError => write!(f, "Sodium error"),
+            Error::SodiumError => write!(f, "sodium error"),
         }
     }
 }
@@ -58,12 +62,12 @@ impl Display for Error {
 impl From<Error> for io::Error {
     fn from(e: Error) -> io::Error {
         match e {
-            Error::UnknownCipherType => io::Error::new(io::ErrorKind::Other, "Unknown Cipher type"),
+            Error::UnknownCipherType => io::Error::new(io::ErrorKind::Other, "unknown cipher type"),
             #[cfg(feature = "openssl")]
             Error::OpenSSLError(err) => From::from(err),
             Error::IoError(err) => err,
             Error::AeadDecryptFailed => io::Error::new(io::ErrorKind::Other, "AEAD decrypt error"),
-            Error::SodiumError => io::Error::new(io::ErrorKind::Other, "Sodium error"),
+            Error::SodiumError => io::Error::new(io::ErrorKind::Other, "sodium error"),
         }
     }
 }
@@ -150,24 +154,29 @@ const CIPHER_XSALSA20: &str = "xsalsa20";
 #[cfg(feature = "sodium")]
 const CIPHER_CHACHA20_IETF: &str = "chacha20-ietf";
 
-#[cfg(feature = "miscreant")]
+#[cfg(feature = "aes-pmac-siv")]
 const CIPHER_AES_128_PMAC_SIV: &str = "aes-128-pmac-siv";
-#[cfg(feature = "miscreant")]
+#[cfg(feature = "aes-pmac-siv")]
 const CIPHER_AES_256_PMAC_SIV: &str = "aes-256-pmac-siv";
 
 const CIPHER_PLAIN: &str = "plain";
+const CIPHER_NONE: &str = "none";
 
+#[cfg(feature = "ring-aead-ciphers")]
 const CIPHER_AES_128_GCM: &str = "aes-128-gcm";
+#[cfg(feature = "ring-aead-ciphers")]
 const CIPHER_AES_256_GCM: &str = "aes-256-gcm";
+#[cfg(feature = "ring-aead-ciphers")]
 const CIPHER_CHACHA20_IETF_POLY1305: &str = "chacha20-ietf-poly1305";
 #[cfg(feature = "sodium")]
 const CIPHER_XCHACHA20_IETF_POLY1305: &str = "xchacha20-ietf-poly1305";
 
 /// ShadowSocks cipher type
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Debug, Copy, EnumIter)]
 pub enum CipherType {
     Table,
     Plain,
+    None,
 
     #[cfg(feature = "aes-cfb")]
     Aes128Cfb,
@@ -242,22 +251,27 @@ pub enum CipherType {
     #[cfg(feature = "sodium")]
     ChaCha20Ietf,
 
+    #[cfg(feature = "ring-aead-ciphers")]
     Aes128Gcm,
+    #[cfg(feature = "ring-aead-ciphers")]
     Aes256Gcm,
 
+    #[cfg(feature = "ring-aead-ciphers")]
     ChaCha20IetfPoly1305,
     #[cfg(feature = "sodium")]
     XChaCha20IetfPoly1305,
 
-    #[cfg(feature = "miscreant")]
+    #[cfg(feature = "aes-pmac-siv")]
     Aes128PmacSiv,
-    #[cfg(feature = "miscreant")]
+    #[cfg(feature = "aes-pmac-siv")]
     Aes256PmacSiv,
 }
 
 /// Category of ciphers
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum CipherCategory {
+    /// No encryption
+    None,
     /// Stream ciphers is used for OLD ShadowSocks protocol, which uses stream ciphers to encrypt data payloads
     Stream,
     /// AEAD ciphers is used in modern ShadowSocks protocol, which sends data in separate packets
@@ -268,7 +282,7 @@ impl CipherType {
     /// Symmetric crypto key size
     pub fn key_size(self) -> usize {
         match self {
-            CipherType::Table | CipherType::Plain => 0,
+            CipherType::Table | CipherType::Plain | CipherType::None => 0,
 
             #[cfg(feature = "aes-cfb")]
             CipherType::Aes128Cfb1 => symm::Cipher::aes_128_cfb1().key_len(),
@@ -351,46 +365,43 @@ impl CipherType {
             #[cfg(feature = "sodium")]
             CipherType::ChaCha20 | CipherType::Salsa20 | CipherType::XSalsa20 | CipherType::ChaCha20Ietf => 32,
 
+            #[cfg(feature = "ring-aead-ciphers")]
             CipherType::Aes128Gcm => AES_128_GCM.key_len(),
+            #[cfg(feature = "ring-aead-ciphers")]
             CipherType::Aes256Gcm => AES_256_GCM.key_len(),
 
+            #[cfg(feature = "ring-aead-ciphers")]
             CipherType::ChaCha20IetfPoly1305 => CHACHA20_POLY1305.key_len(),
 
             #[cfg(feature = "sodium")]
             CipherType::XChaCha20IetfPoly1305 => 32,
 
-            #[cfg(feature = "miscreant")]
+            #[cfg(feature = "aes-pmac-siv")]
             CipherType::Aes128PmacSiv => 32,
-            #[cfg(feature = "miscreant")]
+            #[cfg(feature = "aes-pmac-siv")]
             CipherType::Aes256PmacSiv => 64,
         }
     }
 
     fn classic_bytes_to_key(self, key: &[u8]) -> Bytes {
-        let iv_len = self.iv_size();
+        // key derivation by MD5 hash
+
         let key_len = self.key_size();
+        let digest_len = Md5::output_size();
 
-        if iv_len + key_len == 0 {
-            return Bytes::new();
-        }
+        let mut result = BytesMut::with_capacity((key_len + digest_len - 1) / digest_len);
+        let mut m = None;
 
-        let mut digest = digest::with_type(DigestType::Md5);
+        let mut d = Md5::new();
+        while result.len() < key_len {
+            if let Some(ref rm) = m {
+                d.input(rm);
+            }
+            d.input(key);
+            let digest = d.result_reset();
+            result.put(&*digest);
 
-        let total_loop = (key_len + iv_len + digest.digest_len() - 1) / digest.digest_len();
-        let m_length = digest.digest_len() + key.len();
-
-        let mut result = BytesMut::with_capacity(total_loop * digest.digest_len());
-        let mut m = BytesMut::with_capacity(key.len());
-
-        for _ in 0..total_loop {
-            let mut vkey = mem::replace(&mut m, BytesMut::with_capacity(m_length));
-            vkey.put(key);
-
-            digest.update(&vkey);
-            digest.digest(&mut m);
-            digest.reset();
-
-            result.put_slice(&m);
+            m = Some(digest);
         }
 
         result.truncate(key_len);
@@ -405,115 +416,97 @@ impl CipherType {
     /// Symmetric crypto initialize vector size
     pub fn iv_size(self) -> usize {
         match self {
-            CipherType::Table | CipherType::Plain => 0,
+            CipherType::Table | CipherType::Plain | CipherType::None => 0,
 
             #[cfg(feature = "aes-cfb")]
-            CipherType::Aes128Cfb1 => symm::Cipher::aes_128_cfb1()
-                .iv_len()
-                .expect("iv_len should not be None"),
+            CipherType::Aes128Cfb1 => symm::Cipher::aes_128_cfb1().iv_len().unwrap_or(0),
             #[cfg(feature = "aes-cfb")]
-            CipherType::Aes128Cfb8 => symm::Cipher::aes_128_cfb8()
-                .iv_len()
-                .expect("iv_len should not be None"),
+            CipherType::Aes128Cfb8 => symm::Cipher::aes_128_cfb8().iv_len().unwrap_or(0),
             #[cfg(feature = "aes-cfb")]
-            CipherType::Aes128Cfb | CipherType::Aes128Cfb128 => symm::Cipher::aes_128_cfb128()
-                .iv_len()
-                .expect("iv_len should not be None"),
+            CipherType::Aes128Cfb | CipherType::Aes128Cfb128 => symm::Cipher::aes_128_cfb128().iv_len().unwrap_or(0),
             #[cfg(feature = "aes-cfb")]
-            CipherType::Aes192Cfb1 => symm::Cipher::aes_192_cfb1()
-                .iv_len()
-                .expect("iv_len should not be None"),
+            CipherType::Aes192Cfb1 => symm::Cipher::aes_192_cfb1().iv_len().unwrap_or(0),
             #[cfg(feature = "aes-cfb")]
-            CipherType::Aes192Cfb8 => symm::Cipher::aes_192_cfb8()
-                .iv_len()
-                .expect("iv_len should not be None"),
+            CipherType::Aes192Cfb8 => symm::Cipher::aes_192_cfb8().iv_len().unwrap_or(0),
             #[cfg(feature = "aes-cfb")]
-            CipherType::Aes192Cfb | CipherType::Aes192Cfb128 => symm::Cipher::aes_192_cfb128()
-                .iv_len()
-                .expect("iv_len should not be None"),
+            CipherType::Aes192Cfb | CipherType::Aes192Cfb128 => symm::Cipher::aes_192_cfb128().iv_len().unwrap_or(0),
             #[cfg(feature = "aes-cfb")]
-            CipherType::Aes256Cfb1 => symm::Cipher::aes_256_cfb1()
-                .iv_len()
-                .expect("iv_len should not be None"),
+            CipherType::Aes256Cfb1 => symm::Cipher::aes_256_cfb1().iv_len().unwrap_or(0),
             #[cfg(feature = "aes-cfb")]
-            CipherType::Aes256Cfb8 => symm::Cipher::aes_256_cfb8()
-                .iv_len()
-                .expect("iv_len should not be None"),
+            CipherType::Aes256Cfb8 => symm::Cipher::aes_256_cfb8().iv_len().unwrap_or(0),
             #[cfg(feature = "aes-cfb")]
-            CipherType::Aes256Cfb | CipherType::Aes256Cfb128 => symm::Cipher::aes_256_cfb128()
-                .iv_len()
-                .expect("iv_len should not be None"),
+            CipherType::Aes256Cfb | CipherType::Aes256Cfb128 => symm::Cipher::aes_256_cfb128().iv_len().unwrap_or(0),
 
             #[cfg(feature = "aes-ctr")]
-            CipherType::Aes128Ctr => symm::Cipher::aes_128_ctr().iv_len().expect("iv_len should not be None"),
+            CipherType::Aes128Ctr => symm::Cipher::aes_128_ctr().iv_len().unwrap_or(0),
             #[cfg(feature = "aes-ctr")]
-            CipherType::Aes192Ctr => symm::Cipher::aes_192_ctr().iv_len().expect("iv_len should not be None"),
+            CipherType::Aes192Ctr => symm::Cipher::aes_192_ctr().iv_len().unwrap_or(0),
             #[cfg(feature = "aes-ctr")]
-            CipherType::Aes256Ctr => symm::Cipher::aes_256_ctr().iv_len().expect("iv_len should not be None"),
+            CipherType::Aes256Ctr => symm::Cipher::aes_256_ctr().iv_len().unwrap_or(0),
 
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia128Cfb => symm::Cipher::from_nid(Nid::CAMELLIA_128_CFB128)
                 .expect("openssl doesn't support camellia-128-cfb")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia128Cfb1 => symm::Cipher::from_nid(Nid::CAMELLIA_128_CFB1)
                 .expect("openssl doesn't support camellia-128-cfb1")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia128Cfb8 => symm::Cipher::from_nid(Nid::CAMELLIA_128_CFB8)
                 .expect("openssl doesn't support camellia-128-cfb8")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia128Cfb128 => symm::Cipher::from_nid(Nid::CAMELLIA_128_CFB128)
                 .expect("openssl doesn't support camellia-128-cfb128")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia192Cfb => symm::Cipher::from_nid(Nid::CAMELLIA_192_CFB128)
                 .expect("openssl doesn't support camellia-192-cfb")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia192Cfb1 => symm::Cipher::from_nid(Nid::CAMELLIA_192_CFB1)
                 .expect("openssl doesn't support camellia-192-cfb1")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia192Cfb8 => symm::Cipher::from_nid(Nid::CAMELLIA_192_CFB8)
                 .expect("openssl doesn't support camellia-192-cfb8")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia192Cfb128 => symm::Cipher::from_nid(Nid::CAMELLIA_192_CFB128)
                 .expect("openssl doesn't support camellia-192-cfb128")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia256Cfb => symm::Cipher::from_nid(Nid::CAMELLIA_256_CFB128)
                 .expect("openssl doesn't support camellia-256-cfb")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia256Cfb1 => symm::Cipher::from_nid(Nid::CAMELLIA_256_CFB1)
                 .expect("openssl doesn't support camellia-256-cfb1")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia256Cfb8 => symm::Cipher::from_nid(Nid::CAMELLIA_256_CFB8)
                 .expect("openssl doesn't support camellia-256-cfb8")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
             #[cfg(feature = "camellia-cfb")]
             CipherType::Camellia256Cfb128 => symm::Cipher::from_nid(Nid::CAMELLIA_256_CFB128)
                 .expect("openssl doesn't support camellia-256-cfb128")
                 .iv_len()
-                .expect("iv_len should not be None"),
+                .unwrap_or(0),
 
             #[cfg(feature = "rc4")]
-            CipherType::Rc4 => symm::Cipher::rc4().iv_len().expect("iv_len should not be None"),
+            CipherType::Rc4 => symm::Cipher::rc4().iv_len().unwrap_or(0),
             #[cfg(feature = "rc4")]
             CipherType::Rc4Md5 => 16,
 
@@ -524,20 +517,27 @@ impl CipherType {
             #[cfg(feature = "sodium")]
             CipherType::ChaCha20Ietf => 12,
 
+            #[cfg(feature = "ring-aead-ciphers")]
             CipherType::Aes128Gcm => AES_128_GCM.nonce_len(),
+            #[cfg(feature = "ring-aead-ciphers")]
             CipherType::Aes256Gcm => AES_256_GCM.nonce_len(),
+            #[cfg(feature = "ring-aead-ciphers")]
             CipherType::ChaCha20IetfPoly1305 => CHACHA20_POLY1305.nonce_len(),
             #[cfg(feature = "sodium")]
             CipherType::XChaCha20IetfPoly1305 => 24,
 
-            #[cfg(feature = "miscreant")]
+            #[cfg(feature = "aes-pmac-siv")]
             CipherType::Aes128PmacSiv => 8,
-            #[cfg(feature = "miscreant")]
+            #[cfg(feature = "aes-pmac-siv")]
             CipherType::Aes256PmacSiv => 8,
         }
     }
 
     fn gen_random_bytes(len: usize) -> Bytes {
+        if len == 0 {
+            return Bytes::new();
+        }
+
         let mut iv = BytesMut::with_capacity(len);
         unsafe {
             iv.set_len(len);
@@ -557,12 +557,15 @@ impl CipherType {
     /// Get category of cipher
     pub fn category(self) -> CipherCategory {
         match self {
+            CipherType::None | CipherType::Plain => CipherCategory::None,
+
+            #[cfg(feature = "ring-aead-ciphers")]
             CipherType::Aes128Gcm | CipherType::Aes256Gcm | CipherType::ChaCha20IetfPoly1305 => CipherCategory::Aead,
 
             #[cfg(feature = "sodium")]
             CipherType::XChaCha20IetfPoly1305 => CipherCategory::Aead,
 
-            #[cfg(feature = "miscreant")]
+            #[cfg(feature = "aes-pmac-siv")]
             CipherType::Aes128PmacSiv | CipherType::Aes256PmacSiv => CipherCategory::Aead,
 
             _ => CipherCategory::Stream,
@@ -574,16 +577,19 @@ impl CipherType {
         assert!(self.category() == CipherCategory::Aead);
 
         match self {
+            #[cfg(feature = "ring-aead-ciphers")]
             CipherType::Aes128Gcm => AES_128_GCM.tag_len(),
+            #[cfg(feature = "ring-aead-ciphers")]
             CipherType::Aes256Gcm => AES_256_GCM.tag_len(),
+            #[cfg(feature = "ring-aead-ciphers")]
             CipherType::ChaCha20IetfPoly1305 => CHACHA20_POLY1305.tag_len(),
             #[cfg(feature = "sodium")]
             CipherType::XChaCha20IetfPoly1305 => 16,
 
-            #[cfg(feature = "miscreant")]
+            #[cfg(feature = "aes-pmac-siv")]
             CipherType::Aes128PmacSiv | CipherType::Aes256PmacSiv => 16,
 
-            _ => panic!("Only support AEAD ciphers, found {:?}", self),
+            _ => panic!("only support AEAD ciphers, found {:?}", self),
         }
     }
 
@@ -597,6 +603,110 @@ impl CipherType {
     pub fn gen_salt(self) -> Bytes {
         CipherType::gen_random_bytes(self.salt_size())
     }
+
+    /// Get all available ciphers in String representation
+    pub fn available_ciphers() -> Vec<&'static str> {
+        let mut v = Vec::new();
+        for e in Self::iter() {
+            v.push(e.name());
+        }
+        v
+    }
+
+    /// Name of cipher
+    pub fn name(self) -> &'static str {
+        match self {
+            CipherType::Table => CIPHER_TABLE,
+            CipherType::Plain => CIPHER_PLAIN,
+            CipherType::None => CIPHER_NONE,
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes128Cfb => CIPHER_AES_128_CFB,
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes128Cfb1 => CIPHER_AES_128_CFB_1,
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes128Cfb8 => CIPHER_AES_128_CFB_8,
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes128Cfb128 => CIPHER_AES_128_CFB_128,
+
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes192Cfb => CIPHER_AES_192_CFB,
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes192Cfb1 => CIPHER_AES_192_CFB_1,
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes192Cfb8 => CIPHER_AES_192_CFB_8,
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes192Cfb128 => CIPHER_AES_192_CFB_128,
+
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes256Cfb => CIPHER_AES_256_CFB,
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes256Cfb1 => CIPHER_AES_256_CFB_1,
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes256Cfb8 => CIPHER_AES_256_CFB_8,
+            #[cfg(feature = "aes-cfb")]
+            CipherType::Aes256Cfb128 => CIPHER_AES_256_CFB_128,
+
+            #[cfg(feature = "aes-ctr")]
+            CipherType::Aes128Ctr => CIPHER_AES_128_CTR,
+            #[cfg(feature = "aes-ctr")]
+            CipherType::Aes192Ctr => CIPHER_AES_192_CTR,
+            #[cfg(feature = "aes-ctr")]
+            CipherType::Aes256Ctr => CIPHER_AES_256_CTR,
+
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia128Cfb => CIPHER_CAMELLIA_128_CFB,
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia128Cfb1 => CIPHER_CAMELLIA_128_CFB_1,
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia128Cfb8 => CIPHER_CAMELLIA_128_CFB_8,
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia128Cfb128 => CIPHER_CAMELLIA_128_CFB_128,
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia192Cfb => CIPHER_CAMELLIA_192_CFB,
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia192Cfb1 => CIPHER_CAMELLIA_192_CFB_1,
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia192Cfb8 => CIPHER_CAMELLIA_192_CFB_8,
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia192Cfb128 => CIPHER_CAMELLIA_192_CFB_128,
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia256Cfb => CIPHER_CAMELLIA_256_CFB,
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia256Cfb1 => CIPHER_CAMELLIA_256_CFB_1,
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia256Cfb8 => CIPHER_CAMELLIA_256_CFB_8,
+            #[cfg(feature = "camellia-cfb")]
+            CipherType::Camellia256Cfb128 => CIPHER_CAMELLIA_256_CFB_128,
+
+            #[cfg(feature = "rc4")]
+            CipherType::Rc4 => CIPHER_RC4,
+            #[cfg(feature = "rc4")]
+            CipherType::Rc4Md5 => CIPHER_RC4_MD5,
+
+            #[cfg(feature = "sodium")]
+            CipherType::ChaCha20 => CIPHER_CHACHA20,
+            #[cfg(feature = "sodium")]
+            CipherType::Salsa20 => CIPHER_SALSA20,
+            #[cfg(feature = "sodium")]
+            CipherType::XSalsa20 => CIPHER_XSALSA20,
+            #[cfg(feature = "sodium")]
+            CipherType::ChaCha20Ietf => CIPHER_CHACHA20_IETF,
+
+            #[cfg(feature = "ring-aead-ciphers")]
+            CipherType::Aes128Gcm => CIPHER_AES_128_GCM,
+            #[cfg(feature = "ring-aead-ciphers")]
+            CipherType::Aes256Gcm => CIPHER_AES_256_GCM,
+            #[cfg(feature = "ring-aead-ciphers")]
+            CipherType::ChaCha20IetfPoly1305 => CIPHER_CHACHA20_IETF_POLY1305,
+            #[cfg(feature = "sodium")]
+            CipherType::XChaCha20IetfPoly1305 => CIPHER_XCHACHA20_IETF_POLY1305,
+
+            #[cfg(feature = "aes-pmac-siv")]
+            CipherType::Aes128PmacSiv => CIPHER_AES_128_PMAC_SIV,
+            #[cfg(feature = "aes-pmac-siv")]
+            CipherType::Aes256PmacSiv => CIPHER_AES_256_PMAC_SIV,
+        }
+    }
 }
 
 impl FromStr for CipherType {
@@ -606,6 +716,8 @@ impl FromStr for CipherType {
         match s {
             CIPHER_TABLE | "" => Ok(CipherType::Table),
             CIPHER_PLAIN => Ok(CipherType::Plain),
+            CIPHER_NONE => Ok(CipherType::None),
+
             #[cfg(feature = "aes-cfb")]
             CIPHER_AES_128_CFB => Ok(CipherType::Aes128Cfb),
             #[cfg(feature = "aes-cfb")]
@@ -679,16 +791,19 @@ impl FromStr for CipherType {
             #[cfg(feature = "sodium")]
             CIPHER_CHACHA20_IETF => Ok(CipherType::ChaCha20Ietf),
 
+            #[cfg(feature = "ring-aead-ciphers")]
             CIPHER_AES_128_GCM => Ok(CipherType::Aes128Gcm),
+            #[cfg(feature = "ring-aead-ciphers")]
             CIPHER_AES_256_GCM => Ok(CipherType::Aes256Gcm),
 
+            #[cfg(feature = "ring-aead-ciphers")]
             CIPHER_CHACHA20_IETF_POLY1305 => Ok(CipherType::ChaCha20IetfPoly1305),
             #[cfg(feature = "sodium")]
             CIPHER_XCHACHA20_IETF_POLY1305 => Ok(CipherType::XChaCha20IetfPoly1305),
 
-            #[cfg(feature = "miscreant")]
+            #[cfg(feature = "aes-pmac-siv")]
             CIPHER_AES_128_PMAC_SIV => Ok(CipherType::Aes128PmacSiv),
-            #[cfg(feature = "miscreant")]
+            #[cfg(feature = "aes-pmac-siv")]
             CIPHER_AES_256_PMAC_SIV => Ok(CipherType::Aes256PmacSiv),
 
             _ => Err(Error::UnknownCipherType),
@@ -698,93 +813,7 @@ impl FromStr for CipherType {
 
 impl Display for CipherType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            CipherType::Table => write!(f, "{}", CIPHER_TABLE),
-            CipherType::Plain => write!(f, "{}", CIPHER_PLAIN),
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes128Cfb => write!(f, "{}", CIPHER_AES_128_CFB),
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes128Cfb1 => write!(f, "{}", CIPHER_AES_128_CFB_1),
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes128Cfb8 => write!(f, "{}", CIPHER_AES_128_CFB_8),
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes128Cfb128 => write!(f, "{}", CIPHER_AES_128_CFB_128),
-
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes192Cfb => write!(f, "{}", CIPHER_AES_192_CFB),
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes192Cfb1 => write!(f, "{}", CIPHER_AES_192_CFB_1),
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes192Cfb8 => write!(f, "{}", CIPHER_AES_192_CFB_8),
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes192Cfb128 => write!(f, "{}", CIPHER_AES_192_CFB_128),
-
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes256Cfb => write!(f, "{}", CIPHER_AES_256_CFB),
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes256Cfb1 => write!(f, "{}", CIPHER_AES_256_CFB_1),
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes256Cfb8 => write!(f, "{}", CIPHER_AES_256_CFB_8),
-            #[cfg(feature = "aes-cfb")]
-            CipherType::Aes256Cfb128 => write!(f, "{}", CIPHER_AES_256_CFB_128),
-
-            #[cfg(feature = "aes-ctr")]
-            CipherType::Aes128Ctr => write!(f, "{}", CIPHER_AES_128_CTR),
-            #[cfg(feature = "aes-ctr")]
-            CipherType::Aes192Ctr => write!(f, "{}", CIPHER_AES_192_CTR),
-            #[cfg(feature = "aes-ctr")]
-            CipherType::Aes256Ctr => write!(f, "{}", CIPHER_AES_256_CTR),
-
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia128Cfb => write!(f, "{}", CIPHER_CAMELLIA_128_CFB),
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia128Cfb1 => write!(f, "{}", CIPHER_CAMELLIA_128_CFB_1),
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia128Cfb8 => write!(f, "{}", CIPHER_CAMELLIA_128_CFB_8),
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia128Cfb128 => write!(f, "{}", CIPHER_CAMELLIA_128_CFB_128),
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia192Cfb => write!(f, "{}", CIPHER_CAMELLIA_192_CFB),
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia192Cfb1 => write!(f, "{}", CIPHER_CAMELLIA_192_CFB_1),
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia192Cfb8 => write!(f, "{}", CIPHER_CAMELLIA_192_CFB_8),
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia192Cfb128 => write!(f, "{}", CIPHER_CAMELLIA_192_CFB_128),
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia256Cfb => write!(f, "{}", CIPHER_CAMELLIA_256_CFB),
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia256Cfb1 => write!(f, "{}", CIPHER_CAMELLIA_256_CFB_1),
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia256Cfb8 => write!(f, "{}", CIPHER_CAMELLIA_256_CFB_8),
-            #[cfg(feature = "camellia-cfb")]
-            CipherType::Camellia256Cfb128 => write!(f, "{}", CIPHER_CAMELLIA_256_CFB_128),
-
-            #[cfg(feature = "rc4")]
-            CipherType::Rc4 => write!(f, "{}", CIPHER_RC4),
-            #[cfg(feature = "rc4")]
-            CipherType::Rc4Md5 => write!(f, "{}", CIPHER_RC4_MD5),
-
-            #[cfg(feature = "sodium")]
-            CipherType::ChaCha20 => write!(f, "{}", CIPHER_CHACHA20),
-            #[cfg(feature = "sodium")]
-            CipherType::Salsa20 => write!(f, "{}", CIPHER_SALSA20),
-            #[cfg(feature = "sodium")]
-            CipherType::XSalsa20 => write!(f, "{}", CIPHER_XSALSA20),
-            #[cfg(feature = "sodium")]
-            CipherType::ChaCha20Ietf => write!(f, "{}", CIPHER_CHACHA20_IETF),
-
-            CipherType::Aes128Gcm => write!(f, "{}", CIPHER_AES_128_GCM),
-            CipherType::Aes256Gcm => write!(f, "{}", CIPHER_AES_256_GCM),
-            CipherType::ChaCha20IetfPoly1305 => write!(f, "{}", CIPHER_CHACHA20_IETF_POLY1305),
-            #[cfg(feature = "sodium")]
-            CipherType::XChaCha20IetfPoly1305 => write!(f, "{}", CIPHER_XCHACHA20_IETF_POLY1305),
-
-            #[cfg(feature = "miscreant")]
-            CipherType::Aes128PmacSiv => write!(f, "{}", CIPHER_AES_128_PMAC_SIV),
-            #[cfg(feature = "miscreant")]
-            CipherType::Aes256PmacSiv => write!(f, "{}", CIPHER_AES_256_PMAC_SIV),
-        }
+        f.write_str(self.name())
     }
 }
 
@@ -793,11 +822,11 @@ mod test_cipher {
     use crate::crypto::{new_stream, CipherType, CryptoMode};
 
     #[test]
-    fn test_get_cipher() {
-        let key = CipherType::Aes128Cfb.bytes_to_key(b"PassWORD");
-        let iv = CipherType::Aes128Cfb.gen_init_vec();
-        let mut encryptor = new_stream(CipherType::Aes128Cfb, &key[0..], &iv[0..], CryptoMode::Encrypt);
-        let mut decryptor = new_stream(CipherType::Aes128Cfb, &key[0..], &iv[0..], CryptoMode::Decrypt);
+    fn get_cipher() {
+        let key = CipherType::Table.bytes_to_key(b"PassWORD");
+        let iv = CipherType::Table.gen_init_vec();
+        let mut encryptor = new_stream(CipherType::Table, &key[0..], &iv[0..], CryptoMode::Encrypt);
+        let mut decryptor = new_stream(CipherType::Table, &key[0..], &iv[0..], CryptoMode::Decrypt);
         let message = "HELLO WORLD";
 
         let mut encrypted_msg = Vec::new();
@@ -810,9 +839,20 @@ mod test_cipher {
 
     #[cfg(feature = "rc4")]
     #[test]
-    fn test_rc4_md5_key_iv() {
+    fn rc4_md5_key_iv() {
         let ty = CipherType::Rc4Md5;
         assert_eq!(ty.key_size(), 16);
         assert_eq!(ty.iv_size(), 16);
+    }
+
+    #[cfg(feature = "ring-aead-ciphers")]
+    #[test]
+    fn classic_bytes_to_key() {
+        let ty = CipherType::Aes256Gcm;
+        let vkey = ty.classic_bytes_to_key(b"abc");
+        assert_eq!(
+            &b"\x90\x01P\x98<\xd2O\xb0\xd6\x96?}(\xe1\x7fr\xea\x0b1\xe1\x08z\"\xbcS\x94\xa6cnn\xd3K"[..],
+            &vkey
+        );
     }
 }

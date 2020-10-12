@@ -1,18 +1,16 @@
-use std::{
-    net::{SocketAddr, ToSocketAddrs},
-    thread,
-    time::Duration,
+use std::net::{SocketAddr, ToSocketAddrs};
+
+use tokio::{
+    prelude::*,
+    time::{self, Duration},
 };
 
-use futures::Future;
-use tokio::runtime::current_thread::Runtime;
-use tokio_io::io::{flush, read_to_end, write_all};
-
 use shadowsocks::{
-    config::{Config, ConfigType, Mode, ServerConfig},
+    config::{Config, ConfigType, Mode, ServerAddr, ServerConfig},
     crypto::CipherType,
     relay::{socks5::Address, tcprelay::client::Socks5Client},
-    run_local, run_server,
+    run_local,
+    run_server,
 };
 
 pub struct Socks5TestServer {
@@ -39,8 +37,8 @@ impl Socks5TestServer {
                 cfg
             },
             cli_config: {
-                let mut cfg = Config::new(ConfigType::Local);
-                cfg.local = Some(local_addr);
+                let mut cfg = Config::new(ConfigType::Socks5Local);
+                cfg.local_addr = Some(ServerAddr::from(local_addr));
                 cfg.server = vec![ServerConfig::basic(svr_addr, pwd.to_owned(), method)];
                 cfg.mode = if enable_udp { Mode::TcpAndUdp } else { Mode::TcpOnly };
                 cfg
@@ -52,59 +50,49 @@ impl Socks5TestServer {
         &self.local_addr
     }
 
-    pub fn run(&self) {
+    pub async fn run(&self) {
         let svr_cfg = self.svr_config.clone();
-        thread::spawn(move || {
-            let mut runtime = Runtime::new().expect("Failed to create Runtime");
-            let fut = run_server(svr_cfg);
-            runtime.block_on(fut).expect("Failed to run Server");
-        });
+        tokio::spawn(run_server(svr_cfg));
 
         let client_cfg = self.cli_config.clone();
-        thread::spawn(move || {
-            let mut runtime = Runtime::new().expect("Failed to create Runtime");
-            let fut = run_local(client_cfg);
-            runtime.block_on(fut).expect("Failed to run Local");
-        });
+        tokio::spawn(run_local(client_cfg));
 
-        thread::sleep(Duration::from_secs(1));
+        time::delay_for(Duration::from_secs(1)).await;
     }
 }
 
-#[test]
-fn socks5_relay_stream() {
+#[tokio::test]
+async fn socks5_relay_stream() {
     let _ = env_logger::try_init();
 
     const SERVER_ADDR: &str = "127.0.0.1:8100";
     const LOCAL_ADDR: &str = "127.0.0.1:8200";
 
     const PASSWORD: &str = "test-password";
-    const METHOD: CipherType = CipherType::Aes256Cfb;
+    const METHOD: CipherType = CipherType::Aes128Gcm;
 
     let svr = Socks5TestServer::new(SERVER_ADDR, LOCAL_ADDR, PASSWORD, METHOD, false);
-    svr.run();
+    svr.run().await;
 
-    let c = Socks5Client::connect(
+    let mut c = Socks5Client::connect(
         Address::DomainNameAddress("www.example.com".to_owned(), 80),
-        *svr.client_addr(),
-    );
+        svr.client_addr(),
+    )
+    .await
+    .unwrap();
 
-    let fut = c.and_then(|c| {
-        let req = b"GET / HTTP/1.0\r\nHost: www.example.com\r\nAccept: */*\r\n\r\n";
-        write_all(c, req.to_vec())
-            .and_then(|(c, _)| flush(c))
-            .and_then(|c| read_to_end(c, Vec::new()))
-            .map(|(_, buf)| {
-                println!("Got reply from server: {}", String::from_utf8(buf).unwrap());
-            })
-    });
+    let req = b"GET / HTTP/1.0\r\nHost: www.example.com\r\nAccept: */*\r\n\r\n";
+    c.write_all(req).await.unwrap();
+    c.flush().await.unwrap();
 
-    let mut runtime = Runtime::new().expect("Failed to create Runtime");
-    runtime.block_on(fut).unwrap();
+    let mut buf = Vec::new();
+    c.read_to_end(&mut buf).await.unwrap();
+
+    println!("Got reply from server: {}", String::from_utf8(buf).unwrap());
 }
 
-#[test]
-fn socks5_relay_aead() {
+#[tokio::test]
+async fn socks5_relay_aead() {
     let _ = env_logger::try_init();
 
     const SERVER_ADDR: &str = "127.0.0.1:8110";
@@ -114,22 +102,21 @@ fn socks5_relay_aead() {
     const METHOD: CipherType = CipherType::Aes256Gcm;
 
     let svr = Socks5TestServer::new(SERVER_ADDR, LOCAL_ADDR, PASSWORD, METHOD, false);
-    svr.run();
+    svr.run().await;
 
-    let c = Socks5Client::connect(
+    let mut c = Socks5Client::connect(
         Address::DomainNameAddress("www.example.com".to_owned(), 80),
-        *svr.client_addr(),
-    );
-    let fut = c.and_then(|c| {
-        let req = b"GET / HTTP/1.0\r\nHost: www.example.com\r\nAccept: */*\r\n\r\n";
-        write_all(c, req.to_vec())
-            .and_then(|(c, _)| flush(c))
-            .and_then(|c| read_to_end(c, Vec::new()))
-            .map(|(_, buf)| {
-                println!("Got reply from server: {}", String::from_utf8(buf).unwrap());
-            })
-    });
+        svr.client_addr(),
+    )
+    .await
+    .unwrap();
 
-    let mut runtime = Runtime::new().expect("Failed to create Runtime");
-    runtime.block_on(fut).unwrap();
+    let req = b"GET / HTTP/1.0\r\nHost: www.example.com\r\nAccept: */*\r\n\r\n";
+    c.write_all(req).await.unwrap();
+    c.flush().await.unwrap();
+
+    let mut buf = Vec::new();
+    c.read_to_end(&mut buf).await.unwrap();
+
+    println!("Got reply from server: {}", String::from_utf8(buf).unwrap());
 }

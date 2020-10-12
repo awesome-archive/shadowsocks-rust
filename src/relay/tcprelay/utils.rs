@@ -1,182 +1,49 @@
 //! Utility functions
 
-use std::{
-    io,
-    time::{Duration, Instant},
-};
+use std::{io, net::SocketAddr};
 
-use futures::{Async, Future, Poll};
-use tokio::timer::Delay;
-use tokio_io::{
-    io::{copy, Copy},
-    try_nb, AsyncRead, AsyncWrite,
-};
+use log::trace;
+use socket2::{Domain, SockAddr, Socket, Type};
+use tokio::net::TcpStream;
 
-use super::BUFFER_SIZE;
+/// Connecting to a specific target with TCP protocol
+///
+/// Optionally we can bind to a local address for connecting
+pub async fn connect_tcp_stream(addr: &SocketAddr, outbound_addr: &Option<SocketAddr>) -> io::Result<TcpStream> {
+    match *outbound_addr {
+        None => {
+            trace!("connecting {}", addr);
 
-/// Copies all data from `r` to `w`, abort if timeout reaches
-pub fn copy_timeout<R, W>(r: R, w: W, dur: Duration) -> CopyTimeout<R, W>
-where
-    R: AsyncRead,
-    W: AsyncWrite,
-{
-    CopyTimeout::new(r, w, dur)
-}
-
-/// Copies all data from `r` to `w`, abort if timeout reaches
-pub struct CopyTimeout<R, W>
-where
-    R: AsyncRead,
-    W: AsyncWrite,
-{
-    r: Option<R>,
-    w: Option<W>,
-    timeout: Duration,
-    amt: u64,
-    timer: Option<Delay>,
-    buf: [u8; BUFFER_SIZE],
-    pos: usize,
-    cap: usize,
-}
-
-impl<R, W> CopyTimeout<R, W>
-where
-    R: AsyncRead,
-    W: AsyncWrite,
-{
-    fn new(r: R, w: W, timeout: Duration) -> CopyTimeout<R, W> {
-        CopyTimeout {
-            r: Some(r),
-            w: Some(w),
-            timeout,
-            amt: 0,
-            timer: None,
-            buf: [0u8; BUFFER_SIZE],
-            pos: 0,
-            cap: 0,
+            // Connect with tokio's default API directly
+            TcpStream::connect(addr).await
         }
-    }
+        Some(ref bind_addr) => {
+            // Create TcpStream manually from socket
+            // These functions may not behave exactly the same as tokio's TcpStream::connect
 
-    fn try_poll_timeout(&mut self) -> io::Result<()> {
-        match self.timer.as_mut() {
-            None => Ok(()),
-            Some(t) => match t.poll() {
-                Err(err) => panic!("Failed to poll on timer, err: {}", err),
-                Ok(Async::Ready(..)) => Err(io::Error::new(io::ErrorKind::TimedOut, "connection timed out")),
-                Ok(Async::NotReady) => Ok(()),
-            },
-        }
-    }
+            trace!("connecting {} from {}", addr, bind_addr);
 
-    fn clear_timer(&mut self) {
-        let _ = self.timer.take();
-    }
+            let socket = match *addr {
+                SocketAddr::V4(..) => Socket::new(Domain::ipv4(), Type::stream(), None)?,
+                SocketAddr::V6(..) => Socket::new(Domain::ipv6(), Type::stream(), None)?,
+            };
 
-    fn read_or_set_timeout(&mut self) -> io::Result<usize> {
-        // First, return if timeout
-        self.try_poll_timeout()?;
+            // Bind to local outbound address
+            //
+            // Common failure: EADDRINUSE
+            let bind_addr = SockAddr::from(*bind_addr);
+            socket.bind(&bind_addr)?;
 
-        // Then, unset the previous timeout
-        self.clear_timer();
-
-        match self.r.as_mut().unwrap().read(&mut self.buf) {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    self.timer = Some(Delay::new(Instant::now() + self.timeout));
-                }
-                Err(e)
-            }
-        }
-    }
-
-    fn write_or_set_timeout(&mut self, beg: usize, end: usize) -> io::Result<usize> {
-        // First, return if timeout
-        self.try_poll_timeout()?;
-
-        // Then, unset the previous timeout
-        self.clear_timer();
-
-        match self.w.as_mut().unwrap().write(&self.buf[beg..end]) {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    self.timer = Some(Delay::new(Instant::now() + self.timeout));
-                }
-                Err(e)
-            }
-        }
-    }
-}
-
-impl<R, W> Future for CopyTimeout<R, W>
-where
-    R: AsyncRead,
-    W: AsyncWrite,
-{
-    type Error = io::Error;
-    type Item = (u64, R, W);
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        loop {
-            if self.pos == self.cap {
-                let n = try_nb!(self.read_or_set_timeout());
-
-                if n == 0 {
-                    // If we've written all the data and we've seen EOF, flush out the
-                    // data and finish the transfer.
-                    // done with the entire transfer.
-                    try_nb!(self.w.as_mut().unwrap().flush());
-                    return Ok((self.amt, self.r.take().unwrap(), self.w.take().unwrap()).into());
-                }
-
-                self.pos = 0;
-                self.cap = n;
-
-                // Clear it before write
-                self.clear_timer();
-            }
-
-            // If our buffer has some data, let's write it out!
-            while self.pos < self.cap {
-                let (pos, cap) = (self.pos, self.cap);
-                let i = try_nb!(self.write_or_set_timeout(pos, cap));
-                self.pos += i;
-                self.amt += i as u64;
-            }
-
-            // Clear it before read
-            self.clear_timer();
-        }
-    }
-}
-
-/// Copies all data from `r` to `w` with optional timeout param
-pub fn copy_timeout_opt<R, W>(r: R, w: W, dur: Option<Duration>) -> CopyTimeoutOpt<R, W>
-where
-    R: AsyncRead,
-    W: AsyncWrite,
-{
-    match dur {
-        Some(d) => CopyTimeoutOpt::CopyTimeout(copy_timeout(r, w, d)),
-        None => CopyTimeoutOpt::Copy(copy(r, w)),
-    }
-}
-
-/// Copies all data from `R` to `W`
-pub enum CopyTimeoutOpt<R: AsyncRead, W: AsyncWrite> {
-    Copy(Copy<R, W>),
-    CopyTimeout(CopyTimeout<R, W>),
-}
-
-impl<R: AsyncRead, W: AsyncWrite> Future for CopyTimeoutOpt<R, W> {
-    type Error = io::Error;
-    type Item = (u64, R, W);
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match *self {
-            CopyTimeoutOpt::CopyTimeout(ref mut c) => c.poll(),
-            CopyTimeoutOpt::Copy(ref mut c) => c.poll(),
+            // Connect to the target
+            //
+            // FIXME: This function is not documented as it may be deleted in the future
+            //
+            // mio 0.6.x (tokio 0.2.x is depending on it) will set stream into non-block mode
+            // unix: https://github.com/tokio-rs/mio/blob/v0.6.x/src/sys/unix/tcp.rs#L28
+            // windows: https://github.com/tokio-rs/mio/blob/v0.6.x/src/sys/windows/tcp.rs#L118
+            //
+            // We have to let tokio calls connect for us. Because we don't have a chance to wait until the socket is actually connected
+            TcpStream::connect_std(socket.into_tcp_stream(), addr).await
         }
     }
 }

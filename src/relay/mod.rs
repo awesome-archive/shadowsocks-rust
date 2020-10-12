@@ -1,20 +1,19 @@
 //! Relay server in local and server side implementations.
 
-use futures::Future;
-
-pub mod dns;
 pub(crate) mod dns_resolver;
-mod loadbalancing;
+#[cfg(feature = "local-dns-relay")]
+pub mod dnsrelay;
+pub(crate) mod flow;
+pub(crate) mod loadbalancing;
 pub mod local;
+pub mod manager;
+#[cfg(feature = "local-redir")]
+pub(crate) mod redir;
 pub mod server;
+#[cfg(feature = "local-socks4")]
+pub mod socks4;
 pub mod socks5;
+pub(crate) mod sys;
 pub mod tcprelay;
 pub mod udprelay;
-mod utils;
-
-pub fn boxed_future<T, E, F>(f: F) -> Box<Future<Item = T, Error = E> + Send + 'static>
-where
-    F: Future<Item = T, Error = E> + Send + 'static,
-{
-    Box::new(f)
-}
+pub(crate) mod utils;

@@ -1,163 +1,145 @@
 //! UDP relay proxy server
 
 use std::{
-    io::{self, Cursor, ErrorKind},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
-    time::Duration,
+    io,
+    net::{IpAddr, SocketAddr},
 };
 
-use futures::{self, stream::futures_unordered, Future, Stream};
-use log::{debug, error, info};
-use tokio::{self, net::UdpSocket, util::FutureExt};
+use bytes::BytesMut;
+use futures::{stream::FuturesUnordered, StreamExt};
+use log::{debug, error, info, trace, warn};
+use tokio::{self, sync::mpsc};
 
 use crate::{
-    config::ServerConfig,
     context::SharedContext,
-    relay::{boxed_future, dns_resolver::resolve, socks5::Address},
+    relay::{
+        flow::{SharedMultiServerFlowStatistic, SharedServerFlowStatistic},
+        sys::create_udp_socket,
+    },
 };
 
 use super::{
-    crypto_io::{decrypt_payload, encrypt_payload},
-    PacketStream, SendDgramRc, MAXIMUM_UDP_PAYLOAD_SIZE,
+    association::{ServerAssociation, ServerAssociationManager},
+    MAXIMUM_UDP_PAYLOAD_SIZE,
 };
 
-fn resolve_remote_addr(
-    context: SharedContext,
-    addr: Address,
-) -> impl Future<Item = SocketAddr, Error = io::Error> + Send {
-    match addr {
-        Address::SocketAddress(s) => {
-            if context.config().forbidden_ip.contains(&s.ip()) {
-                let err = io::Error::new(
-                    ErrorKind::Other,
-                    format!("{} is forbidden, failed to connect {}", s.ip(), s),
-                );
-                return boxed_future(futures::done(Err(err)));
-            }
-
-            boxed_future(futures::finished(s))
-        }
-        Address::DomainNameAddress(dname, port) => {
-            let fut = resolve(context, &dname, port, true).map(move |vec_ipaddr| {
-                assert!(!vec_ipaddr.is_empty());
-                vec_ipaddr[0]
-            });
-            boxed_future(fut)
-        }
-    }
+fn association_key(saddr: &SocketAddr) -> [u8; 18] {
+    let mut result = [0; 18];
+    result[..16].copy_from_slice(&match saddr.ip() {
+        IpAddr::V4(ref ip) => ip.to_ipv6_mapped().octets(),
+        IpAddr::V6(ref ip) => ip.octets(),
+    });
+    result[16..].copy_from_slice(&saddr.port().to_ne_bytes());
+    result
 }
 
-fn listen(context: SharedContext, svr_cfg: Arc<ServerConfig>) -> impl Future<Item = (), Error = io::Error> + Send {
-    let listen_addr = *svr_cfg.addr().listen_addr();
-    info!("ShadowSocks UDP listening on {}", listen_addr);
-    futures::lazy(move || UdpSocket::bind(&listen_addr)).and_then(move |socket| {
-        let socket = Arc::new(Mutex::new(socket));
-        PacketStream::new(socket.clone()).for_each(move |(pkt, src)| {
-            let svr_cfg = svr_cfg.clone();
-            let svr_cfg_cloned = svr_cfg.clone();
-            let socket = socket.clone();
-            let context = context.clone();
-            let timeout = svr_cfg.timeout();
-            let rel = futures::lazy(move || decrypt_payload(svr_cfg.method(), svr_cfg.key(), &pkt))
-                .and_then(move |payload| {
-                    // Read Address in the front (ShadowSocks protocol)
-                    Address::read_from(Cursor::new(payload))
-                        .map_err(From::from)
-                        .and_then(move |(r, addr)| {
-                            let header_len = r.position() as usize;
-                            let mut payload = r.into_inner();
-                            payload.drain(..header_len);
-                            let body = payload;
+async fn listen(context: SharedContext, flow_stat: SharedServerFlowStatistic, svr_idx: usize) -> io::Result<()> {
+    let svr_cfg = context.server_config(svr_idx);
+    let listen_addr = svr_cfg.addr().bind_addr(&context).await?;
 
-                            debug!("UDP ASSOCIATE {} -> {}, payload length {} bytes", src, addr, body.len());
-                            Ok((addr, body))
-                        })
-                        .and_then(|(addr, body)| {
-                            let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
-                            UdpSocket::bind(&local_addr).map(|remote_udp| (remote_udp, addr, body))
-                        })
-                        .and_then(|(remote_udp, addr, body)| {
-                            resolve_remote_addr(context, addr.clone())
-                                .and_then(|addr| remote_udp.send_dgram(body, &addr))
-                                .map(|(remote_udp, _)| (remote_udp, addr))
-                        })
-                })
-                .and_then(move |(remote_udp, addr)| {
-                    let buf = vec![0u8; MAXIMUM_UDP_PAYLOAD_SIZE];
-                    let to = timeout.unwrap_or(Duration::from_secs(5));
-                    let caddr = addr.clone();
-                    remote_udp
-                        .recv_dgram(buf)
-                        .timeout(to)
-                        .map_err(move |err| match err.into_inner() {
-                            Some(e) => e,
-                            None => {
-                                error!(
-                                    "Udp associate waiting datagram {} -> {} timed out in {:?}",
-                                    src, caddr, to
-                                );
-                                io::Error::new(io::ErrorKind::TimedOut, "udp recv timed out")
-                            }
-                        })
-                        .and_then(|(_remote_udp, buf, n, _from)| {
-                            let svr_cfg = svr_cfg_cloned;
+    let listener = create_udp_socket(&listen_addr).await?;
+    let local_addr = listener.local_addr().expect("determine port bound to");
+    info!("shadowsocks UDP listening on {}", local_addr);
 
-                            let mut send_buf = Vec::new();
-                            addr.write_to_buf(&mut send_buf);
-                            send_buf.extend_from_slice(&buf[..n]);
-                            encrypt_payload(svr_cfg.method(), svr_cfg.key(), &send_buf).map(|buf| (buf, addr))
-                        })
-                })
-                .and_then(move |(buf, addr)| {
-                    debug!("UDP ASSOCIATE {} <- {}, payload length {} bytes", src, addr, buf.len());
+    let (mut r, mut w) = listener.split();
 
-                    let to = timeout.unwrap_or(Duration::from_secs(5));
-                    let caddr = addr.clone();
-                    SendDgramRc::new(socket, buf, src)
-                        .timeout(to)
-                        .map_err(move |err| match err.into_inner() {
-                            Some(e) => e,
-                            None => {
-                                error!(
-                                    "Udp associate sending datagram {} <- {} timed out in {:?}",
-                                    src, caddr, to
-                                );
-                                io::Error::new(io::ErrorKind::TimedOut, "udp send timed out")
-                            }
-                        })
-                })
-                .map(|_| ());
+    let assoc_manager = ServerAssociationManager::new(context.config());
 
-            tokio::spawn(rel.map_err(|err| {
-                error!("Udp relay error: {}", err);
-            }));
+    // FIXME: Channel size 1024?
+    let (tx, mut rx) = mpsc::channel::<(SocketAddr, BytesMut)>(1024);
 
-            Ok(())
-        })
-    })
+    {
+        // Tokio task for sending data back to clients
+
+        let assoc_manager = assoc_manager.clone();
+        let flow_stat = flow_stat.clone();
+
+        tokio::spawn(async move {
+            while let Some((src, pkt)) = rx.recv().await {
+                let cache_key = association_key(&src);
+                if !assoc_manager.keep_alive(&cache_key).await {
+                    debug!(
+                        "UDP association {} <-> ... is already expired, throwing away packet {} bytes",
+                        src,
+                        pkt.len()
+                    );
+                    continue;
+                }
+
+                if let Err(err) = w.send_to(&pkt, &src).await {
+                    error!("UDP packet send failed, err: {:?}", err);
+                    break;
+                }
+
+                flow_stat.udp().incr_tx(pkt.len());
+            }
+
+            // FIXME: How to stop the outer listener Future?
+        });
+    }
+
+    let mut pkt_buf = vec![0u8; MAXIMUM_UDP_PAYLOAD_SIZE];
+
+    loop {
+        let (recv_len, src) = r.recv_from(&mut pkt_buf).await?;
+
+        // Packet length is limited by MAXIMUM_UDP_PAYLOAD_SIZE, excess bytes will be discarded.
+        let pkt = &pkt_buf[..recv_len];
+
+        trace!("received UDP packet from {}, length {} bytes", src, recv_len);
+        flow_stat.udp().incr_rx(pkt.len());
+
+        if recv_len == 0 {
+            // For windows, it will generate a ICMP Port Unreachable Message
+            // https://docs.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-recvfrom
+            // Which will result in recv_from return 0.
+            //
+            // It cannot be solved here, because `WSAGetLastError` is already set.
+            //
+            // See `relay::udprelay::utils::create_socket` for more detail.
+            continue;
+        }
+
+        // Check ACL
+        if context.check_client_blocked(&src).await {
+            warn!("client {} is blocked by ACL rules", src);
+            continue;
+        }
+
+        // Check or (re)create an association
+        let res = assoc_manager
+            .send_packet(association_key(&src), pkt.to_vec(), async {
+                ServerAssociation::associate(context.clone(), svr_idx, src, tx.clone()).await
+            })
+            .await;
+
+        if let Err(err) = res {
+            error!("failed to create UDP association, {}", err);
+        }
+    }
 }
 
 /// Starts a UDP relay server
-pub fn run(context: SharedContext) -> impl Future<Item = (), Error = io::Error> + Send {
-    let mut vec_fut = Vec::new();
+pub async fn run(context: SharedContext, flow_stat: SharedMultiServerFlowStatistic) -> io::Result<()> {
+    let vec_fut = FuturesUnordered::new();
 
-    for svr in &context.config().server {
-        let svr_cfg = Arc::new(svr.clone());
+    for (svr_idx, svr_cfg) in context.config().server.iter().enumerate() {
+        let context = context.clone();
+        let flow_stat = flow_stat
+            .get(svr_cfg.addr().port())
+            .expect("port not existed in multi-server flow statistic")
+            .clone();
 
-        let svr_fut = listen(context.clone(), svr_cfg);
-        vec_fut.push(boxed_future(svr_fut));
+        let svr_fut = listen(context, flow_stat, svr_idx);
+        vec_fut.push(svr_fut);
     }
 
-    futures_unordered(vec_fut).into_future().then(|res| match res {
-        Ok(..) => {
-            error!("One of UDP servers exited unexpectly without error");
+    match vec_fut.into_future().await.0 {
+        Some(res) => {
+            error!("one of UDP servers exited unexpectly, result: {:?}", res);
             let err = io::Error::new(io::ErrorKind::Other, "server exited unexpectly");
             Err(err)
         }
-        Err((err, ..)) => {
-            error!("One of UDP servers exited unexpectly with error {}", err);
-            Err(err)
-        }
-    })
+        None => unreachable!(),
+    }
 }

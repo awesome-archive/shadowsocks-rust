@@ -1,10 +1,9 @@
 # shadowsocks-rust
 
-[![Codacy Badge](https://api.codacy.com/project/badge/Grade/2029e102e1bd46fb9423cb35980636b7)](https://app.codacy.com/app/zonyitoo/shadowsocks-rust?utm_source=github.com&utm_medium=referral&utm_content=shadowsocks/shadowsocks-rust&utm_campaign=Badge_Grade_Dashboard)
-[![Build Status](https://img.shields.io/travis/shadowsocks/shadowsocks-rust.svg)](https://travis-ci.org/shadowsocks/shadowsocks-rust)
+![Build & Test](https://github.com/shadowsocks/shadowsocks-rust/workflows/Build%20&%20Test/badge.svg)
+![Build Releases](https://github.com/shadowsocks/shadowsocks-rust/workflows/Build%20Releases/badge.svg)
 [![License](https://img.shields.io/github/license/zonyitoo/shadowsocks-rust.svg)](https://github.com/zonyitoo/shadowsocks-rust)
 [![crates.io](https://img.shields.io/crates/v/shadowsocks-rust.svg)](https://crates.io/crates/shadowsocks-rust)
-[![dependency status](https://deps.rs/repo/github/shadowsocks/shadowsocks-rust/status.svg)](https://deps.rs/repo/github/shadowsocks/shadowsocks-rust)
 [![Release](https://img.shields.io/github/release/shadowsocks/shadowsocks-rust.svg)](https://github.com/shadowsocks/shadowsocks-rust/releases)
 
 This is a port of [shadowsocks](https://github.com/shadowsocks/shadowsocks).
@@ -13,7 +12,7 @@ shadowsocks is a fast tunnel proxy that helps you bypass firewalls.
 
 ## Dependencies
 
-* libcrypto (OpenSSL) (Required for `aes-cfb-*` and `rc4` ciphers)
+* libcrypto (OpenSSL) (Required for `aes-*`, `camellia-*` and `rc4` ciphers)
 * libsodium >= 1.0.7 (Required for ciphers that are provided by libsodium)
 
 ## Build & Install
@@ -30,11 +29,37 @@ shadowsocks is a fast tunnel proxy that helps you bypass firewalls.
 
 * `camellia-cfb` - Enabled `camellia-*-cfb` encryption algorithm.
 
-* `single-threaded` - Let `sslocal` and `ssserver` run in single threaded mode (by using `tokio::current_thread::Runtime`).
+* `aes-pmac-siv` - Enabled `aes-*-pmac-siv` encryption algorithm. (Experimental)
 
-Default features: `["sodium", "rc4", "aes-cfb", "aes-ctr"]`.
+  * Supported by [`miscreant`](https://crates.io/crates/miscreant), enable hardware accerlation on x86/x86\_64 with `RUSTFLAGS=-Ctarget-feature=+aes,+ssse3`
 
-NOTE: To disable dependency of OpenSSL, just disable feature `"rc4"`, `"aes-cfb"`, `aes-ctr`, `camellia-cfb`.
+* `single-threaded` - Let `sslocal` and `ssserver` run in single threaded mode (by using Tokio's `basic_scheduler`).
+
+* `trust-dns` - Uses [`trust-dns-resolver`](https://crates.io/crates/trust-dns-resolver) as DNS resolver instead of `tokio`'s builtin.
+
+* `local-http` - Allow using HTTP protocol for `sslocal`
+
+  * `local-http-native-tls` - Support HTTPS with [`native-tls`](https://crates.io/crates/native-tls)
+  
+  * `local-http-rustls` - Support HTTPS with [`rustls`](https://crates.io/crates/rustls)
+
+* `local-tunnel` - Allow using tunnel protocol for `sslocal`
+
+* `local-socks4` - Allow using SOCKS4/4a protocol for `sslocal`
+
+* `local-redir` - Allow using redir (transparent proxy) protocol for `sslocal`
+
+#### Memory Allocators
+
+This project uses system (libc) memory allocator (Rust's default). But it also allows you to use other famous allocators by features:
+
+* `jemalloc` - Uses [jemalloc](http://jemalloc.net/) as global memory allocator
+* `mimalloc` - Uses [mi-malloc](https://microsoft.github.io/mimalloc/) as global memory allocator
+* `tcmalloc` - Uses [TCMalloc](https://google.github.io/tcmalloc/overview.html) as global memory allocator. It tries to link system-wide tcmalloc by default, use vendored from source with `tcmalloc-vendored`.
+
+Default features: `["sodium", "rc4", "aes-cfb", "aes-ctr", "trust-dns", "local-http", "local-http-native-tls", "local-tunnel", "local-socks4"]`.
+
+NOTE: To disable dependency of OpenSSL, just disable feature `rc4`, `aes-cfb`, `aes-ctr`, `camellia-cfb`, `local-http-native-tls`.
 
 ### **crates.io**
 
@@ -51,8 +76,15 @@ then you can find `sslocal` and `ssserver` in `$CARGO_HOME/bin`.
 Requirements:
 
 * Linux x86\_64
+* Windows x86\_64
 
 Download static-linked build [here](https://github.com/shadowsocks/shadowsocks-rust/releases).
+
+Nightly builds could be downloaded from [CircleCI](https://app.circleci.com/pipelines/github/shadowsocks/shadowsocks-rust). [HOW TO](https://github.com/shadowsocks/shadowsocks-rust/issues/251#issuecomment-628692564)
+
+* `build-windows`: Build for `x86_64-pc-windows-msvc`
+* `build-linux`: Build for `x86_64-unknown-linux-gnu`, Debian 9 (Stretch), GLIBC 2.18
+* `build-docker`: Build for `x86_64-unknown-linux-musl`, `x86_64-pc-windows-gnu`, ... (statically linked)
 
 ### **Build from source**
 
@@ -62,10 +94,19 @@ Use cargo to build.
 cargo build --release
 ```
 
-NOTE: If you haven't installed the correct version of `libsodium` in your system, you can set a environment variable `SODIUM_BUILD_STATIC=yes` to let `libsodium-ffi` to build `libsodium` from source, which requires you to have build tools (including GCC, libtools, etc.) installed.
+NOTE: [`libsodium-sys`](https://crates.io/crates/libsodium-sys) builds and links statically to the `libsodium` in its package. Here are some useful environment variables for customizing build processes:
+
+* Find `libsodium` installed in customized path:
+
+  * `SODIUM_LIB_DIR` - Directory path to `libsodium.a` or `sodium.lib`
+  * `SODIUM_SHARED` - Dynamic-link instead of default static-link
+
+* Find `libsodium` with `pkg-config` (*nix), `vcpkg` (MSVC)
+
+  * `SODIUM_USE_PKG_CONFIG=1`
 
 ```bash
-SODIUM_BUILD_STATIC=yes cargo build --release
+SODIUM_USE_PKG_CONFIG=1 cargo build --release
 ```
 
 Then `sslocal` and `ssserver` will appear in `./target/(debug|release)/`, it works similarly as the two binaries in the official ShadowSocks' implementation.
@@ -74,7 +115,7 @@ Then `sslocal` and `ssserver` will appear in `./target/(debug|release)/`, it wor
 make install TARGET=release
 ```
 
-Then `sslocal`, `ssserver` and `ssurl` will be installed in `/usr/local/bin` (variable PREFIX).
+Then `sslocal`, `ssserver`, `sstunnel` and `ssurl` will be installed in `/usr/local/bin` (variable PREFIX).
 
 For Windows users, if you have encountered any problem in building, check and discuss in [#102](https://github.com/shadowsocks/shadowsocks-rust/issues/102).
 
@@ -88,12 +129,20 @@ Requirements:
 ./build/build-release
 ```
 
-Then `sslocal`, `ssserver` and `ssurl` will be packaged in
+Then `sslocal`, `ssserver`, `sstunnel` and `ssurl` will be packaged in
 
-* `./build/shadowsocks-latest-release.x86_64-unknown-linux-musl.tar.gz`
-* `./build/shadowsocks-latest-release.x86_64-unknown-linux-musl.tar.xz`
+* `./build/shadowsocks-${VERSION}-stable.x86_64-unknown-linux-musl.tar.xz`
+* `./build/shadowsocks-${VERSION}-stable.x86_64-pc-windows-gnu.zip`
 
 Read `Cargo.toml` for more details.
+
+### Build OpenSSL from source
+
+Specify feature `openssl-vendored` to let [openssl](https://crates.io/crates/openssl) build from source.
+
+```bash
+cargo build --features "openssl-vendored"
+```
 
 ## Getting Started
 
@@ -107,7 +156,7 @@ Create a ShadowSocks' configuration file. Example
     "local_port": 1080,
     "password": "mypassword",
     "timeout": 300,
-    "method": "aes-256-cfb"
+    "method": "aes-256-gcm"
 }
 ```
 
@@ -122,14 +171,14 @@ In shadowsocks-rust, we also have an extended configuration file format, which i
             "address": "127.0.0.1",
             "port": 1080,
             "password": "hello-world",
-            "method": "bf-cfb",
+            "method": "aes-256-gcm",
             "timeout": 300
         },
         {
             "address": "127.0.0.1",
             "port": 1081,
             "password": "hello-kitty",
-            "method": "aes-128-cfb"
+            "method": "chacha20-ietf-poly1305"
         }
     ],
     "local_port": 8388,
@@ -158,7 +207,7 @@ List all available arguments with `-h`.
 
 ## Usage
 
-Local client
+### Socks5 Local client
 
 ```bash
 # Read local client configuration from file
@@ -171,7 +220,38 @@ sslocal -b "127.0.0.1:1080" -s "[::1]:8388" -m "aes-256-gcm" -k "hello-kitty" --
 sslocal -b "127.0.0.1:1080" --server-url "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@127.0.0.1:8388/?plugin=obfs-local%3Bobfs%3Dtls"
 ```
 
-Server
+### HTTP Local client
+
+```bash
+# Read local client configuration from file
+sslocal -c /path/to/shadowsocks.json --protocol http
+```
+
+All parameters are the same as Socks5 client, except `--protocol http`.
+
+### Tunnel Local client
+
+```bash
+# Read local client configuration from file
+# Set 127.0.0.1:8080 as the target for forwarding to
+sslocal -c /path/to/shadowsocks.json -f "127.0.0.1:8080" --protocol tunnel
+```
+
+### Transparent Proxy Local client
+
+**NOTE**: This is currently only supports
+
+* Linux (with `iptables` targets `REDIRECT` and `TPROXY`)
+* BSDs (with `pf`), such as OS X 10.10+, FreeBSD, ...
+
+```bash
+# Read local client configuration from file
+sslocal -c /path/to/shadowsocks.json --protocol redir
+```
+
+Redirects connections with `iptables` configurations to the port that `sslocal` is listening on.
+
+### Server
 
 ```bash
 # Read server configuration from file
@@ -181,21 +261,135 @@ ssserver -c /path/to/shadowsocks.json
 ssserver -s "[::]:8388" -m "aes-256-gcm" -k "hello-kitty" --plugin "obfs-server" --plugin-opts "obfs=tls"
 ```
 
-DNS Local server
+### Server Manager
+
+Supported [Manage Multiple Users](https://github.com/shadowsocks/shadowsocks/wiki/Manage-Multiple-Users) API:
+
+* `add` - Starts a server instance
+* `remove` - Deletes an existing server instance
+* `list` - Lists all current running servers
+* `ping` - Lists all servers' statistic data
+
+NOTE: `stat` command is not supported. Because servers are running in the same process with the manager itself.
 
 ```bash
-# Read configuration from file
-ssdns -c /path/to/shadowsocks.json
+# Start it just with --manager-address command line parameter
+ssmanager --manager-address "127.0.0.1:6100"
 
-# Pass all parameters via command line
-ssdns -s "[::]:8388" -m "aes-256-gcm" -k "hello-kitty" --dns "8.8.8.8:53"
+# For *nix system, manager can bind to unix socket address
+ssmanager --manager-address "/tmp/shadowsocks-manager.sock"
+
+# You can also provide a configuration file
+#
+# `manager_address` key must be provided in the configuration file
+ssmanager -c /path/to/shadowsocks.json
+
+# Create one server by UDP
+echo 'add: {"server_port":8388,"password":"hello-kitty"}' | nc -u '127.0.0.1' '6100'
+
+# Close one server by unix socket
+echo 'remove: {"server_port":8388}' | nc -Uu '/tmp/shadowsocks-manager.sock'
 ```
 
-For DNS relay server, you can set remote DNS server in configuration file with `dns` key in root object.
+For manager UI, check more details in the [shadowsocks-manager](https://github.com/shadowsocks/shadowsocks-manager) project.
 
-```json
+Example configuration:
+
+```jsonc
 {
-    "dns": "8.8.8.8"
+    // Required option
+    // Address that ssmanager is listening on
+    "manager_address": "127.0.0.1",
+    "manager_port": 6100,
+
+    // Or bind to a Unix Domain Socket
+    "manager_address": "/tmp/shadowsocks-manager.sock",
+
+    "servers": [
+        // These servers will be started automatically when ssmanager is started
+    ],
+
+    // Outbound socket binds to this IP address
+    // For choosing different network interface on the same machine
+    "local_address": "xxx.xxx.xxx.xxx",
+
+    // Other options that may be passed directly to new servers
+}
+```
+
+## Configuration
+
+```jsonc
+{
+    // LOCAL: Listen address
+    // SERVER: Bind address for remote sockets, mostly used for choosing interface
+    "local_address": "127.0.0.1",
+    "local_port": 1080,
+
+    // Server's configuration
+    "server": "0.0.0.0",
+    "server_port": 8388,
+    "method": "aes-256-gcm",
+    "password": "your-password",
+    "plugin": "v2ray-plugin",
+    "plugin_opts": "mode=quic;host=www.shadowsocks.com",
+    "timeout": 5, // Timeout for TCP relay server (in seconds)
+
+    // Extended multiple server configuration
+    // LOCAL: Choosing the best server to connect dynamically
+    // SERVER: Creating multiple servers in one process
+    "servers": [
+        {
+            // Fields are the same as the single server's configuration
+            "address": "0.0.0.0",
+            "port": 8389,
+            "method": "aes-256-gcm",
+            "password": "your-password",
+            "plugin": "...",
+            "plugin_opts": "...",
+            "timeout": 5,
+        }
+    ],
+
+    // Global configurations for UDP associations
+    "udp_timeout": 5, // Timeout for UDP associations (in seconds), 5 minutes by default
+    "udp_max_associations": 512, // Maximum UDP associations to be kept in one server, unlimited by default
+
+    // Options for Manager
+    "manager_address": "127.0.0.1", // Could be a path to UNIX socket, /tmp/shadowsocks-manager.sock
+    "manager_port": 5300, // Not needed for UNIX socket
+
+    // DNS server's address for resolving domain names
+    // For *NIX and Windows, it uses system's configuration by default
+    //
+    // Value could be IP address of DNS server, for example, "8.8.8.8".
+    // DNS client will automatically request port 53 with both TCP and UDP protocol.
+    //
+    // It also allows some pre-defined well-known public DNS servers:
+    // - google (TCP, UDP)
+    // - cloudflare (TCP, UDP)
+    // - cloudflare_tls (TLS), enable by feature "dns-over-tls"
+    // - cloudflare_https (HTTPS), enable by feature "dns-over-https"
+    // - quad9 (TCP, UDP)
+    // - quad9_tls (TLS), enable by feature "dns-over-tls"
+    //
+    // The field is only effective if feature "trust-dns" is enabled.
+    "dns": "google",
+
+    // Mode, could be one of the
+    // - tcp_only
+    // - tcp_and_udp
+    // - udp_only
+    "mode": "tcp_only",
+
+    // TCP_NODELAY
+    "no_delay": false,
+
+    // Soft and Hard limit of file descriptors on *NIX systems
+    "nofile": 10240,
+
+    // Try to resolve domain name to IPv6 (AAAA) addresses first
+    "ipv6_first": false
 }
 ```
 
@@ -222,25 +416,81 @@ For DNS relay server, you can set remote DNS server in configuration file with `
 * `chacha20-ietf-poly1305`, `xchacha20-ietf-poly1305`
 * `aes-128-pmac-siv`, `aes-256-pmac-siv` (experimental)
 
+## ACL
+
+`sslocal`, `ssserver`, and `ssmanager` support ACL file with syntax like [shadowsocks-libev](https://github.com/shadowsocks/shadowsocks-libev). Some examples could be found in [here](https://github.com/shadowsocks/shadowsocks-libev/tree/master/acl).
+
+### Available sections
+
+* For local servers (`sslocal`, `ssredir`, ...)
+  * Modes:
+    * `[bypass_all]` - ACL runs in `BlackList` mode. Bypasses all addresses that didn't match any rules.
+    * `[proxy_all]` - ACL runs in `WhiteList` mode. Proxies all addresses that didn't match any rules.
+  * Rules:
+    * `[bypass_list]` - Rules for connecting directly
+    * `[proxy_list]` - Rules for connecting through proxies
+* For remote servers (`ssserver`)
+  * Modes:
+    * `[reject_all]` - ACL runs in `BlackList` mode. Rejects all clients that didn't match any rules.
+    * `[accept_all]` - ACL runs in `WhiteList` mode. Accepts all clients that didn't match any rules.
+  * Rules:
+    * `[white_list]` - Rules for accepted clients
+    * `[black_list]` - Rules for rejected clients
+    * `[outbound_block_list]` - Rules for blocking outbound addresses.
+
+### Example
+
+```ini
+# SERVERS
+# For ssserver, accepts requests from all clients by default
+[accept_all]
+
+# Blocks these clients
+[black_list]
+1.2.3.4
+127.0.0.1/8
+
+# Disallow these outbound addresses
+[outbound_block_list]
+127.0.0.1/8
+::1
+(^|\.)baidu.com
+
+# CLIENTS
+# For sslocal, ..., bypasses all targets by default
+[bypass_all]
+
+# Proxy these addresses
+[proxy_list]
+(^|\.)google.com
+8.8.8.8
+```
+
 ## Useful Tools
 
 1. `ssurl` is for encoding and decoding ShadowSocks URLs (SIP002). Example:
 
-    ```plain
-    ss://YWVzLTI1Ni1jZmI6cGFzc3dvcmQ@127.0.0.1:8388/?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dwww.baidu.com
-    ```
+  ```plain
+  ss://YWVzLTI1Ni1jZmI6cGFzc3dvcmQ@127.0.0.1:8388/?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dwww.baidu.com
+  ```
 
 ## Notes
 
 It supports the following features:
 
-* [x] Socks5 CONNECT command
-* [x] UDP ASSOCIATE command (partial)
+* [x] SOCKS5 CONNECT command
+* [x] SOCKS5 UDP ASSOCIATE command (partial)
+* [x] SOCKS4/4a CONNECT command
 * [x] Various crypto algorithms
 * [x] Load balancing (multiple servers) and server delay checking
 * [x] [SIP004](https://github.com/shadowsocks/shadowsocks-org/issues/30) AEAD ciphers
 * [x] [SIP003](https://github.com/shadowsocks/shadowsocks-org/issues/28) Plugins
 * [x] [SIP002](https://github.com/shadowsocks/shadowsocks-org/issues/27) Extension ss URLs
+* [x] HTTP Proxy Supports ([RFC 7230](http://tools.ietf.org/html/rfc7230) and [CONNECT](https://tools.ietf.org/html/draft-luotonen-web-proxy-tunneling-01))
+* [x] Defend against replay attacks, [shadowsocks/shadowsocks-org#44](https://github.com/shadowsocks/shadowsocks-org/issues/44)
+* [x] Manager APIs, supporting [Manage Multiple Users](https://github.com/shadowsocks/shadowsocks/wiki/Manage-Multiple-Users)
+* [x] ACL (Access Control List)
+* [x] Support HTTP/HTTPS Proxy protocol
 
 ## TODO
 
@@ -249,11 +499,12 @@ It supports the following features:
 * [x] Improved logging format (waiting for the new official log crate)
 * [ ] Support more ciphers without depending on `libcrypto` (waiting for an acceptable Rust crypto lib implementation)
 * [x] Windows support.
-* [x] Build with stable.
-* [ ] Support HTTP Proxy protocol (it is easy to use another tools to convert HTTP proxy protocol to Socks5, like `privoxy`)
+* [x] Build with stable `rustc`.
+* [x] Support HTTP Proxy protocol
 * [ ] One-time Auth. (Already deprecated according to Shadowsocks' community)
 * [x] AEAD ciphers. (proposed in [SIP004](https://github.com/shadowsocks/shadowsocks-org/issues/30), still under discussion)
 * [x] Choose server based on delay #152
+* [ ] Support TCP Fast Open
 
 ## License
 

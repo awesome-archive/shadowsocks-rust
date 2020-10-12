@@ -1,9 +1,7 @@
 use super::{PluginConfig, PluginMode};
 use crate::config::ServerAddr;
-use std::{
-    net::SocketAddr,
-    process::{Command, Stdio},
-};
+use std::{net::SocketAddr, process::Stdio};
+use tokio::process::Command;
 
 /// For obfsproxy, we use standalone mode for now.
 /// Managed mode needs to use SOCKS5 proxy as forwarder, which is not supported
@@ -32,10 +30,11 @@ use std::{
 pub fn plugin_cmd(plugin: &PluginConfig, remote: &ServerAddr, local: &SocketAddr, mode: PluginMode) -> Command {
     let mut cmd = Command::new(&plugin.plugin);
     cmd.stdin(Stdio::null())
+        .kill_on_drop(true)
         .arg("--data-dir")
         .arg(format!("/tmp/{}_{}_{}", plugin.plugin, remote, local)); // FIXME: Not compatible in Windows
 
-    if let Some(ref opt) = plugin.plugin_opt {
+    if let Some(ref opt) = plugin.plugin_opts {
         cmd.args(opt.split(' '));
     }
 
@@ -51,6 +50,10 @@ pub fn plugin_cmd(plugin: &PluginConfig, remote: &ServerAddr, local: &SocketAddr
             .arg("server")
             .arg(remote.to_string()),
     };
+
+    if !plugin.plugin_args.is_empty() {
+        cmd.args(&plugin.plugin_args);
+    }
 
     cmd
 }
