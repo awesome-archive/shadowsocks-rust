@@ -1,19 +1,21 @@
-Compile static-linked binaries with [`rust-musl-builder`](https://github.com/emk/rust-musl-builder):
+## Build Standalone Binaries
 
-```sh
-# build image use Dockerfile in build dir.
-docker build -t shadowsocks-rust:latest .
-# run command in project root.
-alias rust-musl-builder='docker run --rm -it -v "$(pwd)":/home/rust/src shadowsocks-rust:latest'
-rust-musl-builder cargo build --release
-```
+### Build with `cross`
 
-At the moment, it doesn't attempt to cache libraries between builds, so this is best reserved for making final release builds.
-
-## Helpful Scripts
-
-* `build-release` on *nix environment
+- Install [`cross`](https://github.com/rust-embedded/cross)
 
 ```bash
-./build-release
+cargo install cross
 ```
+
+- Build with cross
+
+```bash
+cross build --target x86_64-unknown-linux-musl
+```
+
+### Predefined build routines
+
+- `build-release`: Build binaries with `cross` and packages outputs into `release` folder
+- `build-host-release`: Build binaries with host's Rust toolchain. *NIX shell script
+- `build-host-release.ps1`: Build binaries with host's Rust toolchain. PowerShell script

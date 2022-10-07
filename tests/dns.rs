@@ -1,84 +1,94 @@
-use std::{
-    collections::HashSet,
-    net::{SocketAddr, UdpSocket},
-    thread,
-    time::Duration,
+#![cfg(all(feature = "local-dns", feature = "server"))]
+
+use std::time::Duration;
+
+use byteorder::{BigEndian, ByteOrder};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpStream, UdpSocket},
+    time,
 };
 
-use dns_parser::{Builder, Packet, QueryClass, QueryType};
-use log::trace;
-use shadowsocks::{
+use shadowsocks_service::{
     config::{Config, ConfigType},
-    run_dns, run_server,
+    run_local,
+    run_server,
 };
-use tokio::runtime::current_thread::Runtime;
 
-const CONFIG: &str = r#"{
-        "server": "127.0.0.1",
-        "server_port": 8988,
-        "local_port": 5030,
-        "local_address": "127.0.0.1",
-        "password": "abc",
-        "timeout": 20,
-        "method": "aes-256-gcm",
-        "mode": "tcp_and_udp",
-        "remote_dns": "114.114.114.114:53"
-    }"#;
-
-#[test]
-fn dns_relay() {
+#[tokio::test]
+async fn dns_relay() {
     let _ = env_logger::try_init();
 
-    let server_cfg = Config::load_from_str(CONFIG, ConfigType::Server).unwrap();
-    let dns_cfg = Config::load_from_str(CONFIG, ConfigType::Local).unwrap();
+    let local_config = Config::load_from_str(
+        r#"{
+            "locals": [
+                {
+                    "local_address": "127.0.0.1",
+                    "local_port": 6110,
+                    "protocol": "dns",
+                    "local_dns_address": "114.114.114.114",
+                    "remote_dns_address": "8.8.8.8"
+                }
+            ],
+            "server": "127.0.0.1",
+            "server_port": 6120,
+            "password": "password",
+            "method": "aes-256-gcm"
+        }"#,
+        ConfigType::Local,
+    )
+    .unwrap();
 
-    trace!("Server: {:?}", server_cfg);
-    trace!("Client: {:?}", dns_cfg);
+    let server_config = Config::load_from_str(
+        r#"{
+            "server": "127.0.0.1",
+            "server_port": 6120,
+            "password": "password",
+            "method": "aes-256-gcm",
+            "mode": "tcp_and_udp"
+        }"#,
+        ConfigType::Server,
+    )
+    .unwrap();
 
-    thread::spawn(move || {
-        let mut runtime = Runtime::new().expect("Failed to create Runtime");
-        runtime.block_on(run_server(server_cfg)).unwrap();
-    });
+    tokio::spawn(run_local(local_config));
+    tokio::spawn(run_server(server_config));
 
-    thread::spawn(move || {
-        let mut runtime = Runtime::new().expect("Failed to create Runtime");
-        runtime.block_on(run_dns(dns_cfg)).unwrap();
-    });
+    time::sleep(Duration::from_secs(1)).await;
 
-    thread::sleep(Duration::from_secs(1));
+    // Query firefox.com, TransactionID: 0x1234
+    static DNS_QUERY: &[u8] = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07firefox\x03com\x00\x00\x01\x00\x01";
 
-    let dns_addr = "127.0.0.1:5030".parse::<SocketAddr>().unwrap();
-    let local_addr = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
-    let local = UdpSocket::bind(&local_addr).unwrap();
-    local.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    local.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    // 1. DoT
+    {
+        let mut c = TcpStream::connect("127.0.0.1:6110").await.unwrap();
 
-    const LOOP_ROUND: usize = 10;
+        let mut len_buf = [0u8; 2];
+        BigEndian::write_u16(&mut len_buf, DNS_QUERY.len() as u16);
+        c.write_all(&len_buf).await.unwrap();
 
-    let mut sent_id = HashSet::<u16, _>::with_capacity(LOOP_ROUND);
-    for _ in 0..LOOP_ROUND {
-        let mut id = rand::random::<u16>();
-        while let Some(..) = sent_id.get(&id) {
-            id = rand::random::<u16>();
-        }
+        c.write_all(DNS_QUERY).await.unwrap();
+        c.flush().await.unwrap();
 
-        sent_id.insert(id);
+        c.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = BigEndian::read_u16(&len_buf);
 
-        let mut builder = Builder::new_query(id, false);
-        builder.add_question("www.example.com", false, QueryType::A, QueryClass::IN);
+        let mut buf = vec![0u8; resp_len as usize];
+        c.read_exact(&mut buf).await.unwrap();
 
-        let payload = builder.build().unwrap();
+        assert!(buf.starts_with(b"\x12\x34"));
+    }
 
-        local.send_to(&payload, &dns_addr).unwrap();
+    // 2. DoU
+    {
+        let c = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        c.send_to(DNS_QUERY, "127.0.0.1:6110").await.unwrap();
 
-        trace!("DNS SENT {:?}", payload);
+        let mut buf = [0u8; 65536];
+        let n = c.recv(&mut buf).await.unwrap();
+        assert!(n >= 12);
 
-        let mut buf = [0u8; 65535];
-        let (len, _) = local.recv_from(&mut buf).unwrap();
-
-        let packet = Packet::parse(&buf[..len]).unwrap();
-
-        trace!("DNS GOT {:?}", packet);
-        assert_eq!(packet.header.id, id);
+        let pkt = &buf[..n];
+        assert_eq!(&pkt[..2], b"\x12\x34");
     }
 }

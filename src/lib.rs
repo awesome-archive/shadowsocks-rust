@@ -1,85 +1,30 @@
-//! shadowsocks is a fast tunnel proxy that helps you bypass firewalls.
-//!
-//! Currently it supports SOCKS5 and HTTP Proxy protocol.
-//!
-//! ## Usage
-//!
-//! Build shadowsocks and you will get at least 2 binaries: `sslocal` and `ssserver`
-//!
-//! Write your servers in a configuration file. Format is defined in
-//! [shadowsocks' documentation](https://github.com/shadowsocks/shadowsocks/wiki)
-//!
-//! For example:
-//!
-//! ```json
-//! {
-//!    "server": "my_server_ip",
-//!    "server_port": 8388,
-//!    "local_address": "127.0.0.1",
-//!    "local_port": 1080,
-//!    "password": "mypassword",
-//!    "timeout": 300,
-//!    "method": "aes-256-cfb"
-//! }
-//! ```
-//!
-//! Save it in file `shadowsocks.json` and run local proxy server with
-//!
-//! ```bash
-//! cargo run --bin sslocal -- -c shadowsocks.json
-//! ```
-//!
-//! Now you can use SOCKS5 protocol to proxy your requests, for example:
-//!
-//! ```bash
-//! curl --socks5-hostname 127.0.0.1:1080 https://www.google.com
-//! ```
-//!
-//! On the server side, you can run the server with
-//!
-//! ```bash
-//! cargo run --bin ssserver -- -c shadowsocks.json
-//! ```
-//!
-//! Server should use the same configuration file as local, except the listen addresses for servers must be socket
-//! addresses.
-//!
-//! Of course, you can also use `cargo install` to install binaries.
-//!
-//! ## API Usage
-//!
-//! Example to write a local server
-//!
-//! ```no_run
-//! use shadowsocks::{run_local, Config, ConfigType};
-//!
-//! let config = Config::load_from_file("shadowsocks.json", ConfigType::Local).unwrap();
-//! run_local(config);
-//! ```
-//!
-//! That's all! And let me show you how to run a proxy server
-//!
-//! ```no_run
-//! use shadowsocks::{run_server, Config, ConfigType};
-//!
-//! let config = Config::load_from_file("shadowsocks.json", ConfigType::Server).unwrap();
-//! run_server(config);
-//! ```
+//! Shadowsocks service command line utilities
 
-#![crate_type = "lib"]
-#![crate_name = "shadowsocks"]
-#![recursion_limit = "128"]
-
-/// ShadowSocks version
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-pub use self::{
-    config::{ClientConfig, Config, ConfigType, Mode, ServerAddr, ServerConfig},
-    relay::{dns::run as run_dns, local::run as run_local, server::run as run_server, tcprelay::client::Socks5Client},
-};
-
+pub mod allocator;
 pub mod config;
-mod context;
-pub mod crypto;
-pub mod plugin;
-pub mod relay;
+#[cfg(unix)]
+pub mod daemonize;
+#[cfg(feature = "logging")]
+pub mod logging;
+pub mod monitor;
+pub mod password;
+pub mod service;
+pub mod sys;
+pub mod validator;
+
+/// Exit code when server exits unexpectedly
+pub const EXIT_CODE_SERVER_EXIT_UNEXPECTEDLY: sysexits::ExitCode = sysexits::ExitCode::Software;
+/// Exit code when server aborted
+pub const EXIT_CODE_SERVER_ABORTED: sysexits::ExitCode = sysexits::ExitCode::Software;
+/// Exit code when loading configuration from file fails
+pub const EXIT_CODE_LOAD_CONFIG_FAILURE: sysexits::ExitCode = sysexits::ExitCode::Config;
+/// Exit code when loading ACL from file fails
+pub const EXIT_CODE_LOAD_ACL_FAILURE: sysexits::ExitCode = sysexits::ExitCode::Config;
+/// Exit code when insufficient params are passed via CLI
+pub const EXIT_CODE_INSUFFICIENT_PARAMS: sysexits::ExitCode = sysexits::ExitCode::Usage;
+
+/// Build timestamp in UTC
+pub const BUILD_TIME: &str = build_time::build_time_utc!();
+
+/// shadowsocks version
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
